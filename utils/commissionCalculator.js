@@ -1,0 +1,20 @@
+const calculateCommission = (price) => {
+    const p = parseFloat(price);
+    if (p < 100) return 10;
+    if (p < 500) return 15;
+    if (p <= 1000) return 25;
+    if (p <= 2000) return 35;
+    if (p < 3000) return 40;
+    if (p < 5000) return 60;
+    if (p < 7000) return 80;
+    if (p <= 10000) return 100;
+    if (p < 20000) return 150;
+    if (p < 30000) return 200;
+    if (p <= 50000) return 250;
+    if (p <= 100000) return 300;
+    if (p <= 200000) return 400;
+    if (p <= 500000) return 700;
+    if (p <= 900000) return 1000;
+    return 1500; 
+};
+module.exports = { calculateCommission };

@@ -1,84 +1,195 @@
-// MODIFIED cartController.js with DEBUGGING LOGS
-
 const db = require('../config/database');
 const { clients } = require('../config/tursoConnection');
+const { calculateDeliveryFee } = require('../utils/deliveryCalculator'); 
+const { calculateCommission } = require('../utils/commissionCalculator');
 
-// Helper to fetch product details (Image/Price/Title) based on IDs in the cart
+// =========================================================
+// Helper: Fetch Products
+// =========================================================
 const fetchProductsFromTurso = async (productIds) => {
     if (!productIds || productIds.length === 0) return [];
-    const uniqueIds = [...new Set(productIds)];
+    const uniqueIds = [...new Set(productIds)].filter(id => id);
+    
     const promises = Object.values(clients).map(async (client) => {
         try {
             const placeholders = uniqueIds.map(() => '?').join(',');
             const res = await client.execute({
-                // Using CAST to handle potential number/string mismatches
-                sql: `SELECT id, title, price, discounted_price, image_urls, supplier_id FROM products WHERE CAST(id AS TEXT) IN (${placeholders})`,
-                args: uniqueIds
+                sql: `SELECT id, title, price, discounted_price, image_urls, supplier_id, package_information, colors, sizes 
+                      FROM products WHERE CAST(id AS TEXT) IN (${placeholders})`,
+                args: uniqueIds.map(String)
             });
             return res.rows;
+        } catch (e) { return []; }
+    });
+    return (await Promise.all(promises)).flat();
+};
+
+// =========================================================
+// Helper: Fetch Variants
+// =========================================================
+const fetchVariantsFromTurso = async (variantIds) => {
+    // 1. Clean IDs: Trim and remove nulls
+    const uniqueIds = [...new Set(variantIds)]
+        .filter(id => id && id !== 'null' && id !== 'undefined')
+        .map(id => String(id).trim());
+    
+    if (uniqueIds.length === 0) {
+        console.log("🛒 [Cart] No valid Variant IDs to fetch.");
+        return [];69
+    }
+
+    console.log(`🛒 [Cart] Fetching Variants:`, uniqueIds);
+    
+    const promises = Object.entries(clients).map(async ([shardName, client]) => {
+        if (!client) return [];
+        try {
+            const placeholders = uniqueIds.map(() => '?').join(',');
+            const sql = `SELECT id, price, image_url, custom_color, custom_size 
+                         FROM variants 
+                         WHERE CAST(id AS TEXT) IN (${placeholders})`;
+
+            const res = await client.execute({ sql, args: uniqueIds });
+            
+            if (res.rows.length > 0) {
+                console.log(`✅ [Cart] Found ${res.rows.length} variants in ${shardName}`);
+            }
+            return res.rows;
         } catch (e) { 
-            // Also log if a specific shard fails
-            console.error("A Turso shard failed:", e.message);
             return []; 
         }
     });
     return (await Promise.all(promises)).flat();
 };
 
+// =========================================================
+// Main: Get Cart
+// =========================================================
 exports.getCart = async (req, res) => {
     try {
         const userId = req.user.id;
-        console.log(`\n--- [DEBUG] START: getCart for user ${userId} ---`);
-
         const [cartItems] = await db.carts.query("SELECT * FROM cart WHERE user_id = ? ORDER BY created_at DESC", [userId]);
-        
-        console.log(`[DEBUG] 1. Found ${cartItems.length} items in the MySQL cart.`);
-        // console.log('[DEBUG] Raw Cart Items:', cartItems); // Optional: uncomment to see full raw data
 
-        if (cartItems.length === 0) {
-            console.log("--- [DEBUG] END: Cart is empty. ---");
-            return res.status(200).json([]);
-        }
+        if (cartItems.length === 0) return res.status(200).json([]);
 
+        // 1. Gather IDs with Aggressive Parsing
         const productIds = cartItems.map(item => item.product_id);
-        console.log('[DEBUG] 2. Extracted Product IDs to search for in Turso:', productIds);
-
-        const products = await fetchProductsFromTurso(productIds);
+        const variantIds = [];
         
-        console.log(`[DEBUG] 3. Found ${products.length} matching products in Turso.`);
-        console.log('[DEBUG] Products returned from Turso:', products); // THIS IS THE MOST IMPORTANT LOG
+        cartItems.forEach((item) => {
+            try {
+                let opts = item.options;
+                
+                // Handle Double-Stringified JSON (Common MySQL Issue)
+                if (typeof opts === 'string') {
+                    try { opts = JSON.parse(opts); } catch(e) {}
+                }
+                if (typeof opts === 'string') {
+                    try { opts = JSON.parse(opts); } catch(e) {}
+                }
 
-        const productMap = new Map(products.map(p => [String(p.id), p])); // Ensure keys are strings for matching
+                if (opts && opts.variantId) {
+                    variantIds.push(opts.variantId);
+                }
+            } catch(e) {
+                console.warn(`⚠️ Error parsing options for item ${item.id}`);
+            }
+        });
 
+        // 2. Fetch Data from Turso
+        const [products, variants] = await Promise.all([
+            fetchProductsFromTurso(productIds),
+            fetchVariantsFromTurso(variantIds)
+        ]);
+
+        const productMap = new Map(products.map(p => [String(p.id).trim(), p]));
+        const variantMap = new Map(variants.map(v => [String(v.id).trim(), v]));
+
+        console.log(`📊 [Cart Summary] Products: ${productMap.size}, Variants Found: ${variantMap.size}`);
+
+        // 3. Merge Data
         const processedCart = cartItems.map(item => {
-            // Use String() to make sure we are comparing string-to-string
-            const product = productMap.get(String(item.product_id));
+            const product = productMap.get(String(item.product_id).trim());
+            
+            // --- PARSE OPTIONS AGAIN FOR LOCAL USE ---
             let parsedOptions = {};
-            try { if (item.options && typeof item.options === 'string') parsedOptions = JSON.parse(item.options); } catch (e) {}
+            try { 
+                parsedOptions = typeof item.options === 'string' ? JSON.parse(item.options) : item.options;
+                if (typeof parsedOptions === 'string') parsedOptions = JSON.parse(parsedOptions);
+            } catch (e) {}
 
+            // --- STEP A: Defaults from Product ---
+            let unitPrice = parseFloat(product?.discounted_price || product?.price || 0);
             let imageUrls = [];
             try { 
                 if (product?.image_urls) imageUrls = typeof product.image_urls === 'string' ? JSON.parse(product.image_urls) : product.image_urls; 
             } catch (e) {}
 
-            const unitPrice = parseFloat(product?.discounted_price || product?.price || 0);
+            // Product Defaults (Fallback)
+            // We strip brackets/quotes just in case
+            let finalColor = product?.colors ? String(product.colors).replace(/[\[\]"]/g, '') : "Standard";
+            let finalSize = product?.sizes ? String(product.sizes).replace(/[\[\]"]/g, '') : "Standard";
+
+            // --- STEP B: Variant Override (Highest Priority) ---
+            const vId = parsedOptions.variantId ? String(parsedOptions.variantId).trim() : null;
+            
+            if (vId) {
+                const variant = variantMap.get(vId);
+                
+                if (variant) {
+                    // Override Price
+                    unitPrice = parseFloat(variant.price || unitPrice);
+                    
+                    // Override Image
+                    if (variant.image_url) {
+                        imageUrls = [variant.image_url, ...imageUrls];
+                    }
+
+                    // ✅ FORCE VARIANT COLOR/SIZE (Source of Truth)
+                    if (variant.custom_color && variant.custom_color !== 'null') {
+                        finalColor = variant.custom_color;
+                    }
+                    if (variant.custom_size && variant.custom_size !== 'null') {
+                        finalSize = variant.custom_size;
+                    }
+                } else {
+                    console.warn(`⚠️ [Cart] Variant ID ${vId} in options but NOT found in DB. Using Product Fallback.`);
+                    
+                    // Priority 2: If Variant lookup failed, use saved cart options if they look valid
+                    if (parsedOptions.color && parsedOptions.color !== "Standard") finalColor = parsedOptions.color;
+                    if (parsedOptions.size && parsedOptions.size !== "Standard") finalSize = parsedOptions.size;
+                }
+            } else {
+                // No Variant ID - Logic for standard products
+                // If saved options exist, prefer them over global product defaults
+                if (parsedOptions.color && parsedOptions.color !== "Standard") finalColor = parsedOptions.color;
+                if (parsedOptions.size && parsedOptions.size !== "Standard") finalSize = parsedOptions.size;
+            }
+
+            // --- STEP C: Fees ---
+            const deliveryFee = calculateDeliveryFee(product?.package_information || "");
+            const commission = calculateCommission(unitPrice);
 
             return {
                 cart_item_id: item.id,
                 quantity: item.quantity,
                 product_id: item.product_id,
-                title: product?.title || 'Product Not Available',
-                price: unitPrice,
+                title: product?.title || 'Product Unavailable',
+                price: unitPrice, 
                 profit: parseFloat(item.profit) || 0,
                 image_urls: imageUrls,
-                options: parsedOptions,
+                options: {
+                    ...parsedOptions,
+                    color: finalColor,
+                    size: finalSize
+                },
+                delivery_fee: deliveryFee,
+                system_commission: commission
             };
         });
-        
-        console.log("--- [DEBUG] END: Finished processing cart. ---");
+
         res.status(200).json(processedCart);
     } catch (error) {
-        console.error("[DEBUG] CRITICAL ERROR in getCart:", error);
+        console.error("GetCart Error:", error);
         res.status(500).json({ message: "Failed to fetch cart." });
     }
 };
@@ -86,15 +197,19 @@ exports.getCart = async (req, res) => {
 exports.addItemToCart = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { productId, quantity } = req.body;
-        if (!productId || !quantity) return res.status(400).json({ message: "Required fields missing" });
+        const { productId, quantity, options, profit } = req.body; 
         
-        let userProfit = parseFloat(req.body.profit) || 0;
-        let cleanOptions = { ...(req.body.options || {}) };
-        if (cleanOptions.profit) delete cleanOptions.profit; // Clean up options
+        if (!productId || !quantity) return res.status(400).json({ message: "Missing fields" });
+
+        const userProfit = parseFloat(profit) || 0;
         
-        const parsedQuantity = parseInt(quantity);
-        const optionsString = JSON.stringify(cleanOptions);
+        // ✅ CRITICAL: Ensure options are clean JSON
+        let finalOptions = options;
+        if (typeof options === 'string') {
+            try { finalOptions = JSON.parse(options); } catch(e) { finalOptions = {}; }
+        }
+
+        const optionsString = JSON.stringify(finalOptions || {});
 
         const [existingItems] = await db.carts.query(
             "SELECT * FROM cart WHERE user_id = ? AND product_id = ? AND options = ?", 
@@ -103,16 +218,19 @@ exports.addItemToCart = async (req, res) => {
 
         if (existingItems.length > 0) {
             const item = existingItems[0];
-            await db.carts.execute("UPDATE cart SET quantity = ?, profit = ? WHERE id = ?", [item.quantity + parsedQuantity, userProfit, item.id]);
+            await db.carts.execute(
+                "UPDATE cart SET quantity = quantity + ?, profit = ? WHERE id = ?", 
+                [parseInt(quantity), userProfit, item.id]
+            );
         } else {
             await db.carts.execute(
                 "INSERT INTO cart (user_id, product_id, quantity, options, profit) VALUES (?, ?, ?, ?, ?)", 
-                [userId, productId, parsedQuantity, optionsString, userProfit]
+                [userId, productId, parseInt(quantity), optionsString, userProfit]
             );
         }
-        res.status(200).json({ message: "Added to cart" });
+        res.status(200).json({ message: "Added" });
     } catch (error) {
-        console.error("Error in addItemToCart:", error);
+        console.error("AddToCart Error:", error);
         res.status(500).json({ message: "Failed to add" });
     }
 };
@@ -122,7 +240,14 @@ exports.removeItemFromCart = async (req, res) => {
         await db.carts.execute("DELETE FROM cart WHERE id = ? AND user_id = ?", [req.params.cartItemId, req.user.id]);
         res.status(200).json({ message: "Removed" });
     } catch (error) {
-        console.error("Error in removeItemFromCart:", error);
+        res.status(500).json({ message: "Failed" });
+    }
+};
+exports.removeItemFromCart = async (req, res) => {
+    try {
+        await db.carts.execute("DELETE FROM cart WHERE id = ? AND user_id = ?", [req.params.cartItemId, req.user.id]);
+        res.status(200).json({ message: "Removed" });
+    } catch (error) {
         res.status(500).json({ message: "Failed" });
     }
 };
