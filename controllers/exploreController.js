@@ -3,6 +3,7 @@
 const { clients } = require('../config/tursoConnection');
 const db = require('../config/database');
 
+// Helper to clean up data types
 const parseProduct = (p) => {
     if (!p) return null;
     try {
@@ -25,12 +26,10 @@ exports.getExploreProducts = async (req, res) => {
         
         const { sort = 'default', hasVideo, showVerified, search, shard } = req.query;
 
-        // --- INTELLIGENT SHARD SELECTION ---
-        // If a specific shard is requested (e.g., 'shard_women_fashion'), only use that one.
-        // Otherwise, query all clients. This is key for performance.
+        // --- 1. INTELLIGENT SHARD SELECTION ---
         const targetClients = shard && clients[shard] ? { [shard]: clients[shard] } : clients;
 
-        // --- BUILD QUERY ---
+        // --- 2. BUILD TURSO QUERY ---
         let baseSql = `SELECT id, title, slug, price, discounted_price, image_urls, video_url, views, supplier_id, created_at, quantity FROM products WHERE 1=1`;
         let countSql = `SELECT COUNT(*) as total FROM products WHERE 1=1`;
         let queryArgs = [];
@@ -47,9 +46,9 @@ exports.getExploreProducts = async (req, res) => {
             countSql += ` AND video_url IS NOT NULL AND video_url != ''`;
         }
 
-        // --- EXECUTE QUERIES ---
+        // --- 3. FETCH DATA FROM TURSO ---
         
-        // Total Count (On Page 1)
+        // A. Get Total Count (Only on page 1)
         let totalCount = 0;
         if (page === 1) {
             const countPromises = Object.values(targetClients).filter(c => c).map(c => 
@@ -60,7 +59,7 @@ exports.getExploreProducts = async (req, res) => {
             totalCount = counts.reduce((a, b) => a + b, 0);
         }
 
-        // Fetch Products
+        // B. Get Raw Products
         const BUFFER_SIZE = limit * 4; 
         const productPromises = Object.values(targetClients).filter(c => c).map(c =>
             c.execute({ sql: `${baseSql} LIMIT ?`, args: [...queryArgs, BUFFER_SIZE] })
@@ -70,46 +69,73 @@ exports.getExploreProducts = async (req, res) => {
         const results = await Promise.all(productPromises);
         let allProducts = results.flat();
 
-        // --- ENRICHMENT (MySQL Data) ---
+        // --- 4. ENRICHMENT (MySQL Data - Verified & DISCOUNTS) ---
+        // This is the "Product Card Data Constructor" logic for the Cart Backend
         if (allProducts.length > 0) {
             const productIds = allProducts.map(p => p.id);
             const supplierIds = [...new Set(allProducts.map(p => p.supplier_id).filter(Boolean))];
 
-            const [ratingsRes, suppliersRes, promotedRes] = await Promise.all([
+            // 🔥 UPDATED: Added discountNamesRes to this Promise.all
+            const [ratingsRes, suppliersRes, promotedRes, discountNamesRes] = await Promise.all([
+                // 1. Ratings
                 db.reviews.query(`SELECT product_id, avg_rating, review_count FROM product_ratings WHERE product_id IN (?)`, [productIds]).catch(() => [[]]),
+                // 2. Suppliers (For Verified Badge)
                 db.suppliers.query(`SELECT id, verified_status FROM suppliers WHERE id IN (?)`, [supplierIds]).catch(() => [[]]),
+                // 3. Promoted Status
                 db.inventory.query("SELECT product_id FROM promoted_products WHERE payment_status='paid' AND end_date > NOW()").catch(() => [[]]),
+                
+                // 4. 🔥 FETCH DISCOUNT NAMES (For Flash Sale Badge) 🔥
+                db.inventory.query(`
+                    SELECT dp.product_id, d.name 
+                    FROM discount_products dp 
+                    JOIN discounts d ON dp.discount_id = d.id 
+                    WHERE d.is_active = 1 
+                    AND dp.product_id IN (?)
+                `, [productIds]).catch(() => [[]])
             ]);
 
+            // Create Maps for O(1) Lookup
             const ratingMap = new Map(ratingsRes[0].map(r => [r.product_id, r]));
-            const supplierMap = new Map(suppliersRes[0].map(s => [s.id, s.verified_status === 'verified']));
+            // Supplier Map (Verified Logic)
+            const supplierMap = new Map(suppliersRes[0].map(s => [s.id, String(s.verified_status).toLowerCase() === 'verified']));
             const promotedSet = new Set(promotedRes[0].map(p => p.product_id));
+            
+            // 🔥 Discount Map (Product ID -> Badge Name) 🔥
+            // We use String() on IDs to ensure matching works between databases
+            const discountNameMap = new Map(discountNamesRes[0].map(d => [String(d.product_id), d.name]));
 
+            // Apply Data to Products
             allProducts = allProducts.map(p => {
                 const parsed = parseProduct(p);
                 const rData = ratingMap.get(p.id) || { avg_rating: 0, review_count: 0 };
+                
                 return {
                     ...parsed,
                     isPromoted: promotedSet.has(p.id),
                     review_count: rData.review_count,
                     avg_rating: parseFloat(rData.avg_rating),
+                    
+                    // Verified Badge Data
                     supplier_verified: supplierMap.get(p.supplier_id) || false,
-                    has_video: !!parsed.video_url 
+                    
+                    // Video Data
+                    has_video: !!parsed.video_url,
+
+                    // 🔥 SEND DISCOUNT LABEL TO FRONTEND 🔥
+                    discount_label: discountNameMap.get(String(p.id)) || null
                 };
             });
         }
 
-        // --- FINAL SORTING & FILTERING ---
+        // --- 5. SORTING & PAGINATION ---
         if (showVerified === 'true') allProducts = allProducts.filter(p => p.supplier_verified);
 
         allProducts.sort((a, b) => {
             if (a.isPromoted !== b.isPromoted) return b.isPromoted ? 1 : -1;
             if (sort === 'newest') return new Date(b.created_at) - new Date(a.created_at);
-            // ... add other sorts as needed
             return b.views - a.views;
         });
 
-        // --- PAGINATION & RESPONSE ---
         const offset = (page - 1) * limit;
         const paginatedProducts = allProducts.slice(offset, offset + limit);
         
