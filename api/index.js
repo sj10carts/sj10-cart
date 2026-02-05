@@ -5,6 +5,7 @@ const compression = require('compression');
 const cartRoutes = require('../routes/cartRoutes');
 const exploreRoutes = require('../routes/exploreRoutes'); // ✅ ADD THIS LINE
 const shopRoutes = require('../routes/shopRoutes'); // ✅ 1. Import
+const discountSectionRoutes = require('../routes/discountSectionRoutes'); // ✅ 1. Import
 const app = express();
 
 app.use(cors());
@@ -14,7 +15,7 @@ app.use(compression());
 app.use('/api/cart', cartRoutes);
 app.use('/api/explore', exploreRoutes); // ✅ ADD THIS LINE
 app.use('/api/shops', shopRoutes); // ✅ 2. Mount
-
+app.use('/api/discount-sections', discountSectionRoutes); // ✅ 2. Mount
 app.get('/', (req, res) => {
     res.json({ status: "SJ10 Cart Service is Running 🛒" });
 });
