@@ -6,14 +6,13 @@ const db = require('../config/database');
 exports.getExploreProducts = async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 50; // ✅ LIMIT INCREASED TO 50
+        const limit = parseInt(req.query.limit) || 50; 
         const { sort = 'smart_ranking', hasVideo, showVerified, search, shard } = req.query;
 
-        // --- 1. INTELLIGENT SHARD SELECTION ---
         const targetClients = shard && shard !== 'all' && clients[shard] ? { [shard]: clients[shard] } : clients;
 
-        // --- 2. BUILD TURSO QUERY (Optimized Columns Only) ---
-        // Fetch only what the Lite Card needs to save RAM and Bandwidth
+        // ✅ FIX: Optimized SQL query. Added 'ORDER BY created_at DESC LIMIT 150' 
+        // This stops Turso from sending thousands of products into Vercel RAM!
         let baseSql = `SELECT id, title, slug, sku, price, discounted_price, image_urls, video_url, views, supplier_id, created_at FROM products WHERE status = 'in_stock'`;
         let countSql = `SELECT COUNT(*) as total FROM products WHERE status = 'in_stock'`;
         let queryArgs = [];
@@ -30,7 +29,9 @@ exports.getExploreProducts = async (req, res) => {
             countSql += ` AND (video_url IS NOT NULL AND video_url != '' OR image_urls LIKE '%.mp4%')`;
         }
 
-        // --- 3. FETCH DATA FROM TURSO ---
+        // Apply strict DB limit to protect server memory
+        baseSql += ` ORDER BY created_at DESC LIMIT 150`;
+
         let totalCount = 0;
         if (page === 1) {
             const countPromises = Object.values(targetClients).filter(c => c).map(c => 
@@ -49,7 +50,6 @@ exports.getExploreProducts = async (req, res) => {
         const results = await Promise.all(productPromises);
         let allProducts = results.flat();
 
-        // --- 4. ENRICHMENT (MySQL Data) ---
         let supplierMap = new Map();
         let ratingMap = new Map();
         let promotedSet = new Set();
@@ -69,7 +69,6 @@ exports.getExploreProducts = async (req, res) => {
             if (promotedRes[0]) promotedRes[0].forEach(p => promotedSet.add(String(p.product_id)));
         }
 
-        // Apply Verified Filter BEFORE sorting & slicing
         if (showVerified === 'true') {
             allProducts = allProducts.filter(p => {
                 const sInfo = supplierMap.get(String(p.supplier_id));
@@ -77,7 +76,7 @@ exports.getExploreProducts = async (req, res) => {
             });
         }
 
-        // --- 5. SMART SORTING ---
+        // Smart Sorting
         allProducts.sort((a, b) => {
             if (sort === 'newest') {
                 return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
@@ -94,11 +93,10 @@ exports.getExploreProducts = async (req, res) => {
             }
         });
 
-        // --- 6. PAGINATION & LITE CARD MAPPING ---
+        // Pagination
         const offset = (page - 1) * limit;
         const paginatedProducts = allProducts.slice(offset, offset + limit);
         
-        // ✅ MAP EXACTLY TO ProductCardLite FORMAT
         const optimizedProducts = paginatedProducts.map(p => {
             const sInfo = supplierMap.get(String(p.supplier_id)) || { verified_status: 'unverified', brand_name: 'Unknown' };
             const rInfo = ratingMap.get(String(p.id)) || { avg_rating: 0, review_count: 0 };
@@ -114,24 +112,15 @@ exports.getExploreProducts = async (req, res) => {
             if (p.video_url && p.video_url.length > 5) hasVideo = true;
 
             return {
-                id: p.id,
-                t: p.title,
-                s: p.slug,
-                sku: p.sku,
-                p: parseFloat(p.price || 0),
-                dp: parseFloat(p.discounted_price || p.price),
-                img: finalImg,
-                v: String(sInfo.verified_status).toLowerCase() === 'verified',
-                b: sInfo.brand_name || 'SJ10',
-                r: parseFloat(rInfo.avg_rating || 0),
-                rc: parseInt(rInfo.review_count || 0),
-                hv: hasVideo
+                id: p.id, t: p.title, s: p.slug, sku: p.sku,
+                p: parseFloat(p.price || 0), dp: parseFloat(p.discounted_price || p.price),
+                img: finalImg, v: String(sInfo.verified_status).toLowerCase() === 'verified',
+                b: sInfo.brand_name || 'SJ10', r: parseFloat(rInfo.avg_rating || 0), rc: parseInt(rInfo.review_count || 0), hv: hasVideo
             };
         });
 
-        // --- 7. CACHING STRATEGY ---
-        // Cache at browser for 1 minute, CDN for 5 minutes
-        res.set('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+        // 🔥 CACHING HEADERS ADDED HERE 🔥
+        res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=3600, stale-while-revalidate=86400');
         
         res.status(200).json({ 
             products: optimizedProducts, 
