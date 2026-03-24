@@ -93,6 +93,7 @@ exports.getActiveDiscountSections = async (req, res) => {
         const validSections = sectionsData.filter(s => s && s.products.length > 0);
         
         console.log(`✅ Sending ${validSections.length} discount sections.`);
+           res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
         res.json(validSections);
 
     } catch (error) {
@@ -162,12 +163,12 @@ exports.getDiscountDetails = async (req, res) => {
                 supplier_verified: sData && String(sData.verified_status) === 'verified'
             };
         });
-
+  res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
         res.json({
             ...discount[0],
             products: finalProducts
         });
-res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
+
     } catch (error) {
         console.error("Single Discount Error:", error);
         res.status(500).json({ message: "Server Error" });
