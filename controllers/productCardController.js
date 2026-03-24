@@ -67,8 +67,13 @@ exports.getProductCards = async (req, res) => {
             return { id: p.id, t: p.title, s: p.slug, sku: p.sku, p: parseFloat(p.price), dp: parseFloat(p.discounted_price || p.price), img: finalImg, v: sInfo.isVerified, b: sInfo.brand, r: rInfo.rating, rc: rInfo.count, hv: hasVideo };
         });
 
-        res.set('Cache-control', 'public, max-age=3600, s-maxage=864000, stale-while-revalidate=86400');
-        res.json({ products: optimizedProducts, page, hasMore: rawProducts.length === limit });
+            res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=432000, stale-while-revalidate=604800');
+        
+        res.json({ 
+            products: optimizedProducts, 
+            page, 
+            hasMore: rawProducts.length === limit 
+        });
     } catch (error) {
         res.status(500).json({ message: "Error fetching cards" });
     }
