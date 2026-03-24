@@ -167,7 +167,7 @@ exports.getDiscountDetails = async (req, res) => {
             ...discount[0],
             products: finalProducts
         });
-
+res.setHeader('Cache-Control', 'public, s-maxage=43200, stale-while-revalidate=3600');
     } catch (error) {
         console.error("Single Discount Error:", error);
         res.status(500).json({ message: "Server Error" });
