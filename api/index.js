@@ -7,6 +7,7 @@ const exploreRoutes = require('../routes/exploreRoutes'); // ✅ ADD THIS LINE
 const shopRoutes = require('../routes/shopRoutes'); // ✅ 1. Import
 const discountSectionRoutes = require('../routes/discountSectionRoutes'); // ✅ 1. Import
 const productCardRoutes = require('../routes/productCardRoutes'); // ✅ ADD THIS
+const socialRoutes = require('../routes/socialRoutes'); // ✅ Import
 const app = express();
 
 app.use(cors());
@@ -16,6 +17,7 @@ app.use(compression());
 app.use('/api/cart', cartRoutes);
 app.use('/api/explore', exploreRoutes); // ✅ ADD THIS LINE
 app.use('/api/shops', shopRoutes); // ✅ 2. Mount
+app.use('/api/social', socialRoutes); // ✅ Mount
 app.use('/api/discount-sections', discountSectionRoutes); // ✅ 2. Mount
 app.use('/api/products/feed-cards', productCardRoutes); // ✅ ADD THIS
 app.get('/', (req, res) => {

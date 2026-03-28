@@ -1,10 +1,9 @@
-// api/routes/shopRoutes.js
-
 const router = require('express').Router();
 const controller = require('../controllers/shopController');
 const auth = require('../middleware/authenticateUser');
+const { apiLimiter } = require('../middleware/rateLimiter');
 
-// Protected route to get followed shops
 router.get('/followed', auth, controller.getFollowedShops);
+router.get('/:id/products', apiLimiter, controller.getSupplierProducts); // ✅ Added
 
 module.exports = router;
