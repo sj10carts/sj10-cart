@@ -2,6 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const compression = require('compression');
+const db = require('../config/database'); // 🟢 FIXED: DB IMPORTED NOW!
 
 // Routes Import
 const cartRoutes = require('../routes/cartRoutes');
@@ -14,7 +15,7 @@ const markazRoutes = require('../routes/markazRoutes');
 const app = express();
 
 // =========================================================================
-// 🚀 1. MANUAL CORS HEADERS MIDDLEWARE (Orders Backend Jaisa Safe & Stable)
+// 🚀 1. MANUAL CORS HEADERS MIDDLEWARE
 // =========================================================================
 app.use((req, res, next) => {
     const allowedOrigins = [
@@ -23,19 +24,16 @@ app.use((req, res, next) => {
         'http://localhost:3000',
         'http://localhost:3001',
         'http://localhost:4005',
-        'http://127.0.0.1:5501', // Local Live Server
+        'http://127.0.0.1:5501', 
         'http://localhost:5501',
         'https://sj10.netlify.app'
     ];
 
     const origin = req.headers.origin;
 
-    // Specific Origin check
     if (allowedOrigins.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
-    } 
-    // Allow non-browser requests
-    else if (!origin) {
+    } else if (!origin) {
         res.setHeader('Access-Control-Allow-Origin', '*');
     }
 
@@ -43,7 +41,6 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization, x-internal-api-key');
 
-    // Handle Preflight (OPTIONS) requests immediately
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
@@ -51,7 +48,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// JSON Payload Limits
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(compression());
@@ -59,7 +55,7 @@ app.use(compression());
 // =========================================================================
 // 🚀 2. ROUTES MOUNTING
 // =========================================================================
-app.use('/api/markaz', markazRoutes); // Mounted on top to bypass restrictions
+app.use('/api/markaz', markazRoutes); 
 app.use('/api/cart', cartRoutes);
 app.use('/api/explore', exploreRoutes); 
 app.use('/api/shops', shopRoutes); 
@@ -77,7 +73,7 @@ if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 4005;
   const startLocal = async () => {
       try {
-          await db.testAllConnections(); 
+          await db.testAllConnections(); // Runs successfully now
           app.listen(PORT, () => {
               console.log(`🛒 Cart Service running locally on http://localhost:${PORT}`);
           });
