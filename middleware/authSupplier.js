@@ -1,0 +1,21 @@
+// middleware/authSupplier.js
+const jwt = require('jsonwebtoken');
+
+const authSupplier = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ message: "Supplier access denied." });
+    }
+
+    jwt.verify(token, process.env.SUPPLIER_JWT_SECRET, (err, decoded) => {
+        if (err) {
+            return res.status(403).json({ message: "Invalid supplier token." });
+        }
+        req.supplier = { id: decoded.id };
+        next();
+    });
+};
+
+module.exports = authSupplier;
