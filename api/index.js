@@ -24,7 +24,8 @@ app.use((req, res, next) => {
         'http://localhost:3001',
         'http://localhost:4005',
         'http://127.0.0.1:5501', // Local Live Server
-        'http://localhost:5501'
+        'http://localhost:5501',
+        'https://sj10.netlify.app'
     ];
 
     const origin = req.headers.origin;
