@@ -1,13 +1,19 @@
-// controllers/markazController.js (Carts Backend)
 const axios = require('axios');
 const cheerio = require('cheerio');
 const db = require('../config/database'); 
 const { clients } = require('../config/tursoConnection'); 
 const { v4: uuidv4 } = require('uuid');
-
 const sharp = require('sharp');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const s3Client = require('../config/s3Client'); 
+const https = require('https');
+
+// Optimized HTTPS Agent for persistent connections
+const httpsAgent = new https.Agent({ 
+    keepAlive: true, 
+    keepAliveMsecs: 1000,
+    rejectUnauthorized: false 
+});
 
 const toTitleCase = (str) => {
     if (!str || str.length < 3) return "";
@@ -15,400 +21,377 @@ const toTitleCase = (str) => {
 };
 
 const userAgents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 ];
 
+// Clean and beautiful SJ10 logo on images
 const createSJ10LogoSVG = (productWidth) => {
     const targetLogoWidth = Math.round(productWidth * 0.22); 
     const targetLogoHeight = Math.round(targetLogoWidth * 0.35); 
-    const svg = `
-    <svg width="${targetLogoWidth}" height="${targetLogoHeight}" viewBox="0 0 120 42" xmlns="http://www.w3.org/2000/svg">
-        <rect width="120" height="42" rx="12" fill="#000000" fill-opacity="0.65" stroke="#3b82f6" stroke-width="2.5"/>
-        <path d="M 23 15 C 23 11, 14 11, 14 15 C 14 18, 23 18, 23 21 C 23 25, 14 25, 14 21" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-        <rect x="50" y="13" width="11" height="13" rx="4" fill="none" stroke="#3b82f6" stroke-width="4"/>
-    </svg>`;
-    return Buffer.from(svg);
+    return Buffer.from(`
+        <svg width="${targetLogoWidth}" height="${targetLogoHeight}" viewBox="0 0 120 42" xmlns="http://www.w3.org/2000/svg">
+            <!-- Semi-transparent dark background pill with dynamic blue border -->
+            <rect width="120" height="42" rx="10" fill="#000000" fill-opacity="0.75" stroke="#3b82f6" stroke-width="2.5"/>
+            <!-- Bold, clean and highly readable SJ10 text -->
+            <text x="50%" y="58%" dominant-baseline="middle" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, sans-serif" font-weight="900" font-size="20" letter-spacing="1.5">SJ10</text>
+        </svg>
+    `);
 };
 
-const getDateTimeStrings = () => {
-    const now = new Date();
-    const dateStr = now.toISOString().split('T')[0].replace(/-/g, '');
-    const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '');
-    return { dateStr, timeStr };
+// Checks if a paragraph contains typical platform boilerplate
+const isBoilerplate = (text) => {
+    const lower = text.toLowerCase();
+    return (
+        lower.includes('markaz') || 
+        lower.includes('reseller') || 
+        lower.includes('wholesale') ||
+        lower.includes('cash on delivery') ||
+        lower.includes('shipping') ||
+        lower.includes('refunds') ||
+        lower.includes('return window') ||
+        lower.includes('all rights reserved') ||
+        lower.includes('terms & conditions') ||
+        lower.includes('contact') ||
+        lower.includes('about us') ||
+        lower.includes('play store') ||
+        lower.includes('made for pakistan')
+    );
 };
 
+// 1. IMAGE PROCESSOR
 const processAndUploadRemoteImage = async (imageUrl, sku, index) => {
     try {
-        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+        console.log(`      📸 [Image] Downloading: ${imageUrl.substring(0, 50)}...`);
+        const response = await axios.get(imageUrl, { 
+            responseType: 'arraybuffer',
+            timeout: 10000,
+            httpsAgent: httpsAgent,
+            headers: { 'User-Agent': userAgents[0] }
+        });
+        
         const fileBuffer = Buffer.from(response.data);
         const metadata = await sharp(fileBuffer).metadata();
-        const targetWidth = Math.min(metadata.width, 720); 
+        const targetWidth = Math.min(metadata.width || 720, 720); 
 
         const logoSVG = createSJ10LogoSVG(targetWidth);
-        let finalBuffer;
-        try {
-            finalBuffer = await sharp(fileBuffer)
-                .resize({ width: targetWidth, withoutEnlargement: true })
-                .composite([{ input: logoSVG, gravity: 'southeast', offset: { right: 12, bottom: 12 } }])
-                .webp({ quality: 55, effort: 3 }) 
-                .toBuffer();
-        } catch (compErr) {
-            finalBuffer = await sharp(fileBuffer)
-                .resize({ width: targetWidth, withoutEnlargement: true })
-                .webp({ quality: 55, effort: 3 }) 
-                .toBuffer();
-        }
+        const finalBuffer = await sharp(fileBuffer)
+            .resize({ width: targetWidth, withoutEnlargement: true })
+            .composite([{ input: logoSVG, gravity: 'southeast', offset: { right: 12, bottom: 12 } }])
+            .webp({ quality: 65 }) 
+            .toBuffer();
 
-        const { dateStr, timeStr } = getDateTimeStrings();
-        const fileKey = `product/${sku}/${sku}-${index}-${dateStr}-${timeStr}.webp`;
+        const now = new Date();
+        const fileKey = `product/${sku}/${sku}-${index}-${now.getTime()}.webp`;
 
         await s3Client.send(new PutObjectCommand({
-            Bucket: process.env.CF_R2_BUCKET_NAME,
-            Key: fileKey,
-            Body: finalBuffer,
-            ContentType: 'image/webp',
-            ACL: 'public-read',
+            Bucket: process.env.CF_R2_BUCKET_NAME, Key: fileKey, Body: finalBuffer, ContentType: 'image/webp'
         }));
+        
+        console.log(`      ✅ [Image] Uploaded: ${fileKey}`);
         return `${process.env.CF_PUBLIC_URL}/${fileKey}`;
     } catch (error) {
-        console.error(`💥 Image Process & Upload Error [${imageUrl}]:`, error.message);
+        console.error(`      ❌ [Image Error] ${sku}: ${error.message}`);
         return null;
     }
 };
 
-// 🎯 SCRAPE FUNCTION (100% DYNAMIC HIGHLIGHTS & DEEP PARAGRAPHS SCANNER)
+// 2. SCRAPE FUNCTION
 exports.scrapeMarkaz = async (req, res) => {
     try {
         const { url } = req.body;
         const markazCodeId = (url.match(/\/(\d+)$/) || ["", ""])[1];
+        const generatedSku = `SJ10-${markazCodeId || Date.now().toString().slice(-6)}`;
 
-        // Using db.sku_master to check existing SKU
-        if (markazCodeId && db.sku_master) {
-            try {
-                const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku LIKE ?", [`%${markazCodeId}%`]);
-                if (existing && existing.length > 0) {
-                    return res.status(400).json({ already_scraped: true, message: `❌ This Markaz Product is already scraped!\nIt is already saved in your database with SKU: ${existing[0].sku}` });
-                }
-            } catch (dbErr) {
-                console.warn("⚠️ [Scrape DB Check Warning] Indexing DB not connected. Skipping duplicate check. Error:", dbErr.message);
+        if (db.sku_master) {
+            const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [generatedSku]);
+            if (existing && existing.length > 0) {
+                console.log(`⚠️ [Scraper] Duplicate detected: ${generatedSku}`);
+                return res.status(400).json({ message: "Product already exists in system", isDuplicate: true });
             }
         }
-
-        const selectedUserAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
-        const { data: html } = await axios.get(url, {
-            headers: { 'User-Agent': selectedUserAgent, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' }
+        
+        const { data: html } = await axios.get(url, { 
+            headers: { 'User-Agent': userAgents[0], 'Accept': 'text/html' },
+            httpsAgent: httpsAgent,
+            timeout: 10000 
         });
-
         const $ = cheerio.load(html);
-        let source = html.replace(/\\\\/g, '\\').replace(/\\"/g, '"');
 
-        let title = "";
-        let description = "";
-        let productCode = "";
-        let salePrice = 0;
-        let originalPrice = 0;
-        let images = [];
+        let title = "", salePrice = 0, originalPrice = 0, images = [], variants = [], description = "";
 
-        // 🚀 1. NEXT.JS HYDRATION PARSER (Safe Navigation)
         try {
-            const nextDataScript = $('#__NEXT_DATA__').html();
-            if (nextDataScript) {
-                const nextData = JSON.parse(nextDataScript);
-                const props = nextData?.props?.pageProps;
-                const product = props?.product || props?.productDetails || props?.initialData?.product;
+            const nextData = JSON.parse($('#__NEXT_DATA__').html());
+            const product = nextData?.props?.pageProps?.product || nextData?.props?.pageProps?.initialData?.product;
+            
+            if (product) {
+                title = product.title || "";
+                salePrice = parseInt(product.price || 0);
+                originalPrice = parseInt(product.oldPrice || 0);
+                description = product.description || product.longDescription || "";
                 
-                if (product) {
-                    title = product.title || product.name || "";
-                    productCode = product.productCode || product.code || "";
-                    salePrice = parseInt(product.price || 0);
-                    originalPrice = parseInt(product.oldPrice || 0);
-                    
-                    if (product.images && Array.isArray(product.images)) {
-                        images = product.images.map(img => typeof img === 'string' ? img : (img.url || img.src || ''));
-                    }
-
-                    const rawDesc = product.description || product.longDescription || "";
-                    if (rawDesc && !rawDesc.includes('"@context"') && !rawDesc.startsWith('{')) {
-                        description = rawDesc.trim();
-                    }
+                if (product.images && Array.isArray(product.images)) {
+                    images = product.images.map(img => {
+                        if (typeof img === 'string') return img;
+                        return img.url || img.src || img.original;
+                    }).filter(url => url && url.includes('http'));
                 }
             }
-        } catch (jsonErr) {}
-
-        // =================================================================
-        // 🟢 2. DYNAMIC SPECIFICATION/HIGHLIGHTS EXTRACTOR (Fashion Friendly)
-        // =================================================================
-        // Yeh kisi bhi "Label: Value" format (e.g. Shirt Fabric: Organza) ko automatic utha lega
-        let specs = [];
-        $('div, p, li, span').each((i, el) => {
-            if ($(el).children().length === 0) {
-                const txt = $(el).text()?.trim() || "";
-                if (/^[A-Za-z0-9\s/'-]+:\s*(.+)/.test(txt)) {
-                    // Exclude standard false positives
-                    if (!txt.includes('Product Code') && 
-                        !txt.includes('PKR') && 
-                        !txt.includes('Add to bag') && 
-                        !txt.includes('Charges') &&
-                        !txt.includes('Delivery') &&
-                        !txt.includes('Note:')) {
-                        specs.push(txt);
-                    }
-                }
-            }
-        });
-        const cleanSpecs = [...new Set(specs)].join('\n');
-
-        // =================================================================
-        // 🟢 3. DEEP PARAGRAPHS SCANNER (Main long description text)
-        // =================================================================
-        let paragraphs = [];
-        $('p, div, span').each((i, el) => {
-            if ($(el).children().length === 0) {
-                const txt = $(el).text()?.trim() || "";
-                if (txt.length > 50 && txt.length < 1500) {
-                    if (!txt.includes('{') && 
-                        !txt.includes('PKR') && 
-                        !txt.includes('Add to bag') && 
-                        !txt.includes('similar products') && 
-                        !txt.includes('You might also like') && 
-                        !txt.includes('Delivery') && 
-                        !txt.includes('Charges') && 
-                        !txt.includes('Return allowed') && 
-                        !txt.includes('Show more') &&
-                        !/^[A-Za-z0-9\s/'-]+:\s*(.+)/.test(txt)) { // Exclude key-value specs
-                        paragraphs.push(txt);
-                    }
-                }
-            }
-        });
-        const cleanDescBody = [...new Set(paragraphs)].slice(0, 3).join('\n\n');
-
-        // =================================================================
-        // 🟢 4. MERGE EVERYTHING INTO A BEAUTIFUL DESCRIPTION
-        // =================================================================
-        let finalDescription = "";
-        if (cleanSpecs) {
-            finalDescription += "Highlights:\n" + cleanSpecs + "\n\n";
-        }
-        if (cleanDescBody) {
-            finalDescription += cleanDescBody;
-        } else if (description) {
-            finalDescription += description;
-        } else {
-            finalDescription += "Premium quality product.";
-        }
-
-        // Clean out codes or leftovers
-        finalDescription = finalDescription.replace(/Product Code:\s*[A-Z0-9]+/gi, '').trim();
-        finalDescription = finalDescription.replace(/MZ[A-Z0-9]{12,20}/gi, '').trim();
-
-        if (!title) {
-            title = $('meta[property="og:title"]').attr('content') || $('title').text() || "";
-            title = title.replace(/ – Markaz| - Markaz App/ig, '').trim();
-        }
-
-        // =================================================================
-        // 🟢 5. SMART RETAIL PRICE OVERRIDE
-        // =================================================================
-        let displayPrice = 0;
-        $('*').each((i, el) => {
-            if ($(el).children().length === 0) {
-                const text = $(el).text().trim();
-                const match = text.match(/^(?:PKR|Rs\.?)\s*([\d,]+)$/i);
-                if (match) {
-                    const val = parseInt(match[1].replace(/,/g, ''));
-                    if (val > 250 && val !== 165) {
-                        if (!displayPrice) displayPrice = val;
-                    }
-                }
-            }
-        });
-
-        if (displayPrice) { salePrice = displayPrice; }
-
-        if (salePrice && !originalPrice) {
-            originalPrice = salePrice + Math.floor(salePrice * 0.15); 
-        }
-        if (salePrice > originalPrice && originalPrice > 0) {
-            let temp = salePrice; salePrice = originalPrice; originalPrice = temp;
-        }
-
-        if (!salePrice) salePrice = 1000;
-        if (!originalPrice) originalPrice = salePrice + Math.floor(salePrice * 0.15);
+        } catch (e) { console.log("   ⚠️ JSON Parse skip..."); }
 
         if (images.length === 0) {
             const ogImg = $('meta[property="og:image"]').attr('content');
-            if (ogImg && !ogImg.toLowerCase().includes('logo')) images.push(ogImg);
+            if (ogImg) images.push(ogImg);
+
+            $('img').each((i, el) => {
+                const src = $(el).attr('src') || $(el).attr('data-src');
+                if (src && src.includes('http') && !src.includes('logo') && !src.includes('icon') && src.includes('product')) {
+                    images.push(src);
+                }
+            });
         }
 
-        let localCats = [];
-        try {
-            const [rows] = await db.inventory.query("SELECT id, name, db_shard, parent_id FROM categories ORDER BY name ASC");
-            localCats = rows;
-        } catch (e) {}
+        images = [...new Set(images)].filter(img => img.startsWith('http')).slice(0, 6);
 
-        const finalId = markazCodeId || Date.now().toString().slice(-6);
+        if (!title) title = $('h1').first().text().trim() || "Markaz Product";
+        title = title.replace(/ – Markaz| - Markaz App/ig, '').trim();
+
+        if (!salePrice) {
+            const m = $('body').text().match(/PKR\s*([\d,]+)/i);
+            if (m) salePrice = parseInt(m[1].replace(/,/g, ''));
+        }
+
+        // Deep Description Scanner (EXCLUDING Footers, Navbars, Headers, and Boilerplate)
+        if (!description || description.length < 50) {
+            let pTexts = [];
+            $('p, span, div').not('footer *, nav *, header *, script, style, form *').each((i, el) => {
+                const txt = $(el).text().trim();
+                // Pick text that looks like actual description and doesn't belong to boilerplate code
+                if (txt.length > 50 && txt.length < 1500 && !txt.includes('{') && !txt.includes('PKR')) {
+                    if (!isBoilerplate(txt)) {
+                        pTexts.push(txt);
+                    }
+                }
+            });
+            description = pTexts.sort((a, b) => b.length - a.length)[0] || "";
+        }
+
+        let specs = [];
+        $('div, p, li, span').not('footer *, nav *, header *').each((i, el) => {
+            const txt = $(el).text().trim();
+            if (/^(Material|Texture|Skin Types|Color|Product Feature|Package Includes|Volume|Weight|Set Of|Note):\s*.+/i.test(txt)) {
+                if (!isBoilerplate(txt)) {
+                    specs.push(txt);
+                }
+            }
+        });
+
+        let finalDescription = (specs.length > 0 ? "Highlights:\n" + [...new Set(specs)].join('\n') + "\n\n" : "") + description;
+
+        // Strip Markaz custom product codes
+        finalDescription = finalDescription
+            .replace(/(?:product\s+)?code\s*:\s*[\w\d-]+/gi, '')
+            .replace(/sku\s*:\s*[\w\d-]+/gi, '')
+            .replace(/product\s+id\s*:\s*[\w\d-]+/gi, '')
+            .replace(/\n\s*\n+/g, '\n\n') 
+            .trim();
+
+        let fColors = [], fSizes = [];
+        $('div, span, label').not('footer *, nav *, header *').each((i, el) => {
+            const txt = $(el).text().trim();
+            if (/^(Color|Size)\s*:$/i.test(txt)) {
+                $(el).parent().find('button, span').each((j, chip) => {
+                    const val = $(chip).text().trim();
+                    if (val && val.length < 20 && val !== txt && !val.includes('PKR') && val.length > 1) {
+                        if (/Color/i.test(txt)) fColors.push(val); else fSizes.push(val);
+                    }
+                });
+            }
+        });
+
+        fColors = [...new Set(fColors)]; fSizes = [...new Set(fSizes)];
+        if (fColors.length > 0 && fSizes.length > 0) {
+            fColors.forEach(c => fSizes.forEach(s => variants.push({ color: c, size: s, price: salePrice, image: images[0] })));
+        } else if (fColors.length > 0) {
+            fColors.forEach(c => variants.push({ color: c, size: '', price: salePrice, image: images[0] }));
+        } else if (fSizes.length > 0) {
+            fSizes.forEach(s => variants.push({ color: '', size: s, price: salePrice, image: images[0] }));
+        } else {
+            variants.push({ color: '', size: '', price: salePrice, image: images[0] });
+        }
+
+        console.log(`🔍 [Scraper] "${title.substring(0, 30)}..." | Images Found: ${images.length} | Variants: ${variants.length}`);
 
         res.json({
-            title: toTitleCase(title) || "Markaz Product",
-            description: finalDescription, // 🟢 Now uses fully compiled description
-            markaz_product_code: productCode,
-            markaz_code_id: finalId,
-            salePrice: salePrice, 
-            cutPrice: originalPrice, 
-            images: images.length > 0 ? [...new Set(images)] : ["https://via.placeholder.com/400"],
-            sku: `SJ10-${finalId}`, 
-            categories: localCats
+            title: toTitleCase(title), 
+            salePrice: salePrice || 1000,
+            cutPrice: originalPrice || Math.round((salePrice || 1000) * 1.2),
+            images, 
+            variants, 
+            sku: generatedSku,
+            description: finalDescription || "Premium Quality Product", 
+            markaz_product_code: markazCodeId
         });
-    } catch (e) {
-        console.error("💥 [Scrape] Critical Controller Error:", e);
-        res.status(500).json({ message: "Network Error ya link invalid hai: " + e.message });
+
+    } catch (e) { 
+        console.error("❌ Scrape Error:", e.message);
+        res.status(500).json({ message: "Scrape Failed" }); 
     }
 };
 
-// 🎯 SAVE PRODUCT 
+// 3. SAVE PRODUCT
 exports.saveProduct = async (req, res) => {
+    const { title, sku, images, variants, shardKey, selectedSupplierId, salePrice, cutPrice, categoryId, description } = req.body;
+    
+    console.log(`\n============================================`);
+    console.log(`🚀 [Save] PROCESS STARTED | SKU: ${sku}`);
+    console.log(`============================================`);
+
     try {
-        const { title, description, categoryId, shardKey, salePrice, cutPrice, sku, images, selectedSupplierId, variants, imported_region, package_information } = req.body;
-        const supplierToSave = selectedSupplierId || req.supplier?.id; 
+        const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
+        const client = clients[shardKey] || clients.shard_general;
 
-        console.log(`\n============================================`);
-        console.log(`🚀 [Server 3] Save Product Started for SKU: ${sku}`);
-        console.log(`============================================`);
-
-        let cleanTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').substring(0, 70);
-        let numericId = sku.replace(/[^0-9]/g, '') || Math.floor(100000 + Math.random() * 900000).toString();
-        let finalSlug = cleanTitle, finalSku = sku; 
-
+        // --- STEP 0: STRICT DUPLICATE CHECK ---
         if (db.sku_master) {
-            try {
-                const [existing] = await db.sku_master.query("SELECT id FROM sku_views WHERE sku = ? OR slug = ?", [finalSku, finalSlug]);
-                if (existing && existing.length > 0) {
-                    const randomSuffix = Math.floor(10 + Math.random() * 90);
-                    finalSlug = `${cleanTitle}-${randomSuffix}`;
-                    finalSku = `SJ10-${numericId}${randomSuffix}`;
-                }
-            } catch (e) {}
+            console.log(`   Step 0: Checking duplicate for SKU: ${sku}...`);
+            const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
+            if (existing && existing.length > 0) {
+                console.warn(`   ⚠️ [Save] ABORTED: Product with SKU ${sku} already exists.`);
+                return res.status(400).json({ message: "Duplicate Entry! Product is already saved." });
+            }
         }
 
-        const limitImages = (images && images.length > 0) ? images.slice(0, 4) : [];
-        const uploadPromises = limitImages.map((imgUrl, idx) => processAndUploadRemoteImage(imgUrl, finalSku, idx + 1));
-        const processedImageUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
+        // --- STEP 1: PARALLEL IMAGE UPLOAD ---
+        console.log(`   Step 1: Processing ${images?.length || 0} Images...`);
+        const imageList = (images || []).slice(0, 4);
+        
+        const uploadPromises = imageList.map((img, idx) => processAndUploadRemoteImage(img, sku, idx + 1));
+        const uploadedUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
 
-        if (processedImageUrls.length === 0) return res.status(400).json({ message: "❌ Product must have at least 1 working image." });
+        if (uploadedUrls.length === 0) {
+            console.error(`   ❌ [Save] ABORTED: No images were successful.`);
+            return res.status(400).json({ message: "Image upload failed." });
+        }
+        console.log(`   ✅ Step 1 Done: ${uploadedUrls.length} images ready.`);
 
-        const client = clients[shardKey] || clients.shard_general;
+        // --- STEP 2: DB INSERT PRODUCT ---
+        console.log(`   Step 2: Inserting Product into Turso Shard [${shardKey}]...`);
         const newId = uuidv4();
+        const slug = (title || "prod").toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
 
-        // 1. WRITE TO TURSO SHARD
         await client.execute({
-            sql: `INSERT INTO products (
-                id, supplier_id, category_id, title, description, price, discounted_price, quantity,
-                status, sku, slug, attributes, image_urls, video_url, created_at, package_information,
-                imported_region, warranty_details, colors, sizes, season, image_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            sql: `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at, package_information, imported_region) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             args: [
-                newId, supplierToSave, categoryId, title, description, cutPrice, salePrice, 100,
-                'in_stock', finalSku, finalSlug, '{}', JSON.stringify(processedImageUrls), null, new Date().toISOString(),
-                package_information || "20x20x10 cm, 0.5kg", imported_region || 'Pakistan', null, '[]', '[]', 'No Season', processedImageUrls[0]
+                newId, supplierToSave, categoryId || null, title, 
+                description || "Premium Quality Product", 
+                cutPrice || Math.round(salePrice * 1.2), salePrice, 100, 'in_stock', sku, slug,
+                JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString(), "20x20x10 cm, 0.5kg", "Pakistan"
             ]
         });
+        console.log(`   ✅ Step 2 Done: Main product row created.`);
 
+        // --- STEP 3: DB INSERT VARIANTS (BATCHED) ---
         if (variants && variants.length > 0) {
-            for (const v of variants) {
-                await client.execute({
-                    sql: `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, is_custom, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                    args: [uuidv4(), newId, v.color, v.size, v.price, 100, 1, v.image || processedImageUrls[0]]
-                }).catch(()=>{});
-            }
+            console.log(`   Step 3: Batch Inserting ${variants.length} Variants...`);
+            const variantQueries = variants.map(v => {
+                const cS = v.color ? v.color.substring(0,3).toUpperCase() : 'DEF';
+                const sS = v.size ? v.size.substring(0,3).toUpperCase() : 'STD';
+                const vSku = `${sku}-${cS}-${sS}`;
+                return {
+                    sql: `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, is_custom, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    args: [uuidv4(), newId, v.color || null, v.size || null, v.price || salePrice, 100, vSku, 1, uploadedUrls[0]]
+                };
+            });
+            await client.batch(variantQueries, "write");
+            console.log(`   ✅ Step 3 Done: Variants created.`);
         }
 
-        // 🟢 2. WRITE TO CENTRAL SKU views (Using db.sku_master)
+        // --- STEP 4: REGISTER IN SKU MASTER ---
         if (db.sku_master) {
-            try {
-                console.log(`[Save Product] Registering in sku_views...`);
-                await db.sku_master.query("INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", [uuidv4(), newId, finalSku, finalSlug]);
-                console.log(`✅ [Save Product] Successfully registered in sku_views!`);
-            } catch (skuErr) { console.error("❌ Registry Error:", skuErr.message); }
+            console.log(`   Step 4: Registering in Sku Master...`);
+            await db.sku_master.query(
+                "INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", 
+                [uuidv4(), newId, sku, slug]
+            ).catch(e => console.log("   ⚠️ Sku Master Error:", e.message));
         }
 
-        db.suppliers.execute("UPDATE suppliers SET total_products = total_products + 1 WHERE id = ?", [supplierToSave]).catch(()=>{});
+        console.log(`============================================`);
+        console.log(`✅ [Save] ALL STEPS SUCCESSFUL!`);
+        console.log(`============================================`);
+        
+        res.json({ success: true, sku });
 
-        res.json({ success: true, slug: `${finalSlug}-${finalSku}`, sku: finalSku });
     } catch (e) {
-        res.status(500).json({ message: "Save Failed: " + e.message });
+        console.error(`\n💥 [Save] FATAL CRASH at Step:`, e.message);
+        res.status(500).json({ message: e.message });
     }
 };
 
-// 🎯 BULK SAVE PRODUCTS
+// 4. BULK SAVE
 exports.bulkSaveProducts = async (req, res) => {
     try {
-        const { products, categoryId, shardKey, imported_region, selectedSupplierId } = req.body;
-        if (!products || !Array.isArray(products)) return res.status(400).json({ message: "Invalid array" });
-
+        const { products, categoryId, shardKey, selectedSupplierId } = req.body;
         const client = clients[shardKey] || clients.shard_general;
-        const supplierToSave = selectedSupplierId;
+        const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
         const savedSkus = [];
 
+        console.log(`\n============================================`);
+        console.log(`🚀 [Bulk Save] Started for ${products.length} Products`);
+        console.log(`============================================`);
+
         for (const prod of products) {
-            const { title, description, salePrice, cutPrice, sku, images, variants, package_information } = prod;
-            let cleanTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').substring(0, 70);
-            let numericId = sku.replace(/[^0-9]/g, '') || Math.floor(100000 + Math.random() * 900000).toString();
-            let finalSlug = cleanTitle, finalSku = sku; 
-
+            const { title, salePrice, sku, images, variants } = prod;
+            
             if (db.sku_master) {
-                try {
-                    const [existing] = await db.sku_master.query("SELECT id FROM sku_views WHERE sku = ? OR slug = ?", [finalSku, finalSlug]);
-                    if (existing && existing.length > 0) {
-                        const randomSuffix = Math.floor(10 + Math.random() * 90);
-                        finalSlug = `${cleanTitle}-${randomSuffix}`;
-                        finalSku = `SJ10-${numericId}${randomSuffix}`;
-                    }
-                } catch (e) {}
-            }
-
-            const limitImages = (images && images.length > 0) ? images.slice(0, 4) : [];
-            const uploadPromises = limitImages.map((imgUrl, idx) => processAndUploadRemoteImage(imgUrl, finalSku, idx + 1));
-            const processedImageUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
-
-            if (processedImageUrls.length === 0) continue; 
-
-            const newId = uuidv4();
-            await client.execute({
-                sql: `INSERT INTO products (
-                    id, supplier_id, category_id, title, description, price, discounted_price, quantity,
-                    status, sku, slug, attributes, image_urls, video_url, created_at, package_information,
-                    imported_region, warranty_details, colors, sizes, season, image_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                args: [
-                    newId, supplierToSave, categoryId, title, description, cutPrice, salePrice, 100,
-                    'in_stock', finalSku, finalSlug, '{}', JSON.stringify(processedImageUrls), null, new Date().toISOString(),
-                    package_information || "20x20x10 cm, 0.5kg", imported_region || 'Pakistan', null, '[]', '[]', 'No Season', processedImageUrls[0]
-                ]
-            });
-
-            if (variants && variants.length > 0) {
-                for (const v of variants) {
-                    await client.execute({
-                        sql: `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, is_custom, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                        args: [uuidv4(), newId, v.color, v.size, v.price, 100, 1, v.image || processedImageUrls[0]]
-                    }).catch(()=>{});
+                const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
+                if (existing && existing.length > 0) {
+                    console.warn(`❌ [Bulk] Skipped "${title}" - SKU ${sku} already exists.`);
+                    continue; 
                 }
             }
 
-            // 🟢 2. WRITE TO CENTRAL SKU views (Using db.sku_master)
-            if (db.sku_master) {
-                await db.sku_master.query("INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", [uuidv4(), newId, finalSku, finalSlug]).catch(()=>{});
+            const uploadPromises = images.slice(0, 4).map((img, idx) => processAndUploadRemoteImage(img, sku, idx + 1));
+            const uploadedUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
+
+            if (uploadedUrls.length === 0) {
+                console.error(`❌ [Bulk] Skipped "${title}" - No images processed.`);
+                continue; 
             }
-            db.suppliers.execute("UPDATE suppliers SET total_products = total_products + 1 WHERE id = ?", [supplierToSave]).catch(()=>{});
-            savedSkus.push(finalSku);
+
+            const newId = uuidv4();
+            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+            try {
+                await client.execute({
+                    sql: `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    args: [
+                        newId, supplierToSave, categoryId, title, "Premium Product", 
+                        salePrice + 200, salePrice, 100, 'in_stock', sku, slug, 
+                        JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString()
+                    ]
+                });
+
+                if (variants && variants.length > 0) {
+                    const variantQueries = variants.map(v => ({
+                        sql: `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                        args: [uuidv4(), newId, v.color, v.size, v.price || salePrice, 100, `${sku}-VAR`, uploadedUrls[0]]
+                    }));
+                    await client.batch(variantQueries, "write");
+                }
+                
+                if (db.sku_master) {
+                    await db.sku_master.query(
+                        "INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", 
+                        [uuidv4(), newId, sku, slug]
+                    ).catch(e => console.log("   ⚠️ Sku Master Error:", e.message));
+                }
+
+                savedSkus.push(sku);
+                console.log(`✅ [Bulk] Saved: ${sku} (${variants.length} vars)`);
+            } catch (err) { console.error(`❌ [Bulk] DB Fail: ${title}`, err.message); }
         }
 
-        res.json({ success: true, savedCount: savedSkus.length, skus: savedSkus });
-    } catch (e) {
-        res.status(500).json({ message: "Bulk Save Failed: " + e.message });
-    }
+        res.json({ success: true, savedCount: savedSkus.length });
+    } catch (e) { res.status(500).json({ message: e.message }); }
 };
 
 exports.getTeam = async (req, res) => {
