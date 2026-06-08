@@ -8,7 +8,7 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const s3Client = require('../config/s3Client'); 
 const https = require('https');
 
-// Optimized HTTPS Agent for persistent connections
+// Optimized HTTPS Agent for persistent connections (Fast Scrape/Image Download)
 const httpsAgent = new https.Agent({ 
     keepAlive: true, 
     keepAliveMsecs: 1000,
@@ -25,21 +25,19 @@ const userAgents = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 ];
 
-// Clean and beautiful SJ10 logo on images
+// Generates a semi-transparent dark badge with a blue border and bold "SJ10" text
 const createSJ10LogoSVG = (productWidth) => {
     const targetLogoWidth = Math.round(productWidth * 0.22); 
     const targetLogoHeight = Math.round(targetLogoWidth * 0.35); 
     return Buffer.from(`
         <svg width="${targetLogoWidth}" height="${targetLogoHeight}" viewBox="0 0 120 42" xmlns="http://www.w3.org/2000/svg">
-            <!-- Semi-transparent dark background pill with dynamic blue border -->
             <rect width="120" height="42" rx="10" fill="#000000" fill-opacity="0.75" stroke="#3b82f6" stroke-width="2.5"/>
-            <!-- Bold, clean and highly readable SJ10 text -->
             <text x="50%" y="58%" dominant-baseline="middle" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, sans-serif" font-weight="900" font-size="20" letter-spacing="1.5">SJ10</text>
         </svg>
     `);
 };
 
-// Checks if a paragraph contains typical platform boilerplate
+// Filters out generic platform and marketplace marketing boilerplate
 const isBoilerplate = (text) => {
     const lower = text.toLowerCase();
     return (
@@ -59,7 +57,7 @@ const isBoilerplate = (text) => {
     );
 };
 
-// 1. IMAGE PROCESSOR
+// 1. IMAGE PROCESSOR (Sharp + S3/R2 WebP converter)
 const processAndUploadRemoteImage = async (imageUrl, sku, index) => {
     try {
         console.log(`      📸 [Image] Downloading: ${imageUrl.substring(0, 50)}...`);
@@ -96,13 +94,71 @@ const processAndUploadRemoteImage = async (imageUrl, sku, index) => {
     }
 };
 
+// Dynamic database auto-scan for fetching categories
+const fetchAllCategories = async () => {
+    let categories = [];
+
+    // Strategy A: Scan database keys to locate where the 'categories' table exists
+    try {
+        const dbKeys = Object.keys(db);
+        console.log("🔍 [Categories Scan] Scanning database pools for 'categories' table...");
+        
+        for (const key of dbKeys) {
+            const pool = db[key];
+            if (pool && typeof pool.query === 'function' && key !== 'testAllConnections') {
+                try {
+                    const [rows] = await pool.query("SELECT id, name, parent_id, db_shard FROM categories ORDER BY name ASC");
+                    if (rows && rows.length > 0) {
+                        console.log(`🎯 [Success] Found 'categories' table in "db.${key}" pool! Loaded ${rows.length} rows.`);
+                        return rows;
+                    }
+                } catch (err) {
+                    // Silent catch, table not in this pool, continue scanning
+                }
+            }
+        }
+    } catch (scanErr) {
+        console.log("⚠️ DB Dynamic Auto-Scan failed:", scanErr.message);
+    }
+
+    // Strategy B: Fallback to central Turso (shard_general) if core database query yields nothing
+    try {
+        if (clients && clients.shard_general) {
+            const result = await clients.shard_general.execute({ sql: "SELECT id, name, parent_id, db_shard FROM categories" });
+            if (result && result.rows && result.rows.length > 0) {
+                console.log(`📚 [Categories Fallback] Fetched ${result.rows.length} rows from Turso shard_general`);
+                return result.rows.map(r => ({
+                    id: r.id,
+                    name: r.name,
+                    parent_id: r.parent_id,
+                    db_shard: r.db_shard
+                }));
+            }
+        }
+    } catch (err) {
+        console.log("⚠️ Turso shard_general check failed:", err.message);
+    }
+
+    console.log("❌ [Categories Scan] 'categories' table could not be found in any database pool.");
+    return categories;
+};
+
 // 2. SCRAPE FUNCTION
 exports.scrapeMarkaz = async (req, res) => {
     try {
         const { url } = req.body;
+
+        // --- STEP 1: QUICK HANDSHAKE FOR FRONTEND CATEGORIES ---
+        if (url === "https://www.markaz.app/" || !url) {
+            const categories = await fetchAllCategories();
+            return res.json({ categories });
+        }
+
+        // --- NORMAL SCRAPER CODE ---
         const markazCodeId = (url.match(/\/(\d+)$/) || ["", ""])[1];
         const generatedSku = `SJ10-${markazCodeId || Date.now().toString().slice(-6)}`;
 
+        // Check Duplicate first
         if (db.sku_master) {
             const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [generatedSku]);
             if (existing && existing.length > 0) {
@@ -110,6 +166,8 @@ exports.scrapeMarkaz = async (req, res) => {
                 return res.status(400).json({ message: "Product already exists in system", isDuplicate: true });
             }
         }
+
+        const categories = await fetchAllCategories();
         
         const { data: html } = await axios.get(url, { 
             headers: { 'User-Agent': userAgents[0], 'Accept': 'text/html' },
@@ -166,7 +224,6 @@ exports.scrapeMarkaz = async (req, res) => {
             let pTexts = [];
             $('p, span, div').not('footer *, nav *, header *, script, style, form *').each((i, el) => {
                 const txt = $(el).text().trim();
-                // Pick text that looks like actual description and doesn't belong to boilerplate code
                 if (txt.length > 50 && txt.length < 1500 && !txt.includes('{') && !txt.includes('PKR')) {
                     if (!isBoilerplate(txt)) {
                         pTexts.push(txt);
@@ -188,7 +245,6 @@ exports.scrapeMarkaz = async (req, res) => {
 
         let finalDescription = (specs.length > 0 ? "Highlights:\n" + [...new Set(specs)].join('\n') + "\n\n" : "") + description;
 
-        // Strip Markaz custom product codes
         finalDescription = finalDescription
             .replace(/(?:product\s+)?code\s*:\s*[\w\d-]+/gi, '')
             .replace(/sku\s*:\s*[\w\d-]+/gi, '')
@@ -230,7 +286,8 @@ exports.scrapeMarkaz = async (req, res) => {
             variants, 
             sku: generatedSku,
             description: finalDescription || "Premium Quality Product", 
-            markaz_product_code: markazCodeId
+            markaz_product_code: markazCodeId,
+            categories: categories
         });
 
     } catch (e) { 
@@ -251,7 +308,6 @@ exports.saveProduct = async (req, res) => {
         const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
         const client = clients[shardKey] || clients.shard_general;
 
-        // --- STEP 0: STRICT DUPLICATE CHECK ---
         if (db.sku_master) {
             console.log(`   Step 0: Checking duplicate for SKU: ${sku}...`);
             const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
@@ -261,7 +317,6 @@ exports.saveProduct = async (req, res) => {
             }
         }
 
-        // --- STEP 1: PARALLEL IMAGE UPLOAD ---
         console.log(`   Step 1: Processing ${images?.length || 0} Images...`);
         const imageList = (images || []).slice(0, 4);
         
@@ -274,7 +329,6 @@ exports.saveProduct = async (req, res) => {
         }
         console.log(`   ✅ Step 1 Done: ${uploadedUrls.length} images ready.`);
 
-        // --- STEP 2: DB INSERT PRODUCT ---
         console.log(`   Step 2: Inserting Product into Turso Shard [${shardKey}]...`);
         const newId = uuidv4();
         const slug = (title || "prod").toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
@@ -290,7 +344,6 @@ exports.saveProduct = async (req, res) => {
         });
         console.log(`   ✅ Step 2 Done: Main product row created.`);
 
-        // --- STEP 3: DB INSERT VARIANTS (BATCHED) ---
         if (variants && variants.length > 0) {
             console.log(`   Step 3: Batch Inserting ${variants.length} Variants...`);
             const variantQueries = variants.map(v => {
@@ -306,7 +359,6 @@ exports.saveProduct = async (req, res) => {
             console.log(`   ✅ Step 3 Done: Variants created.`);
         }
 
-        // --- STEP 4: REGISTER IN SKU MASTER ---
         if (db.sku_master) {
             console.log(`   Step 4: Registering in Sku Master...`);
             await db.sku_master.query(
@@ -417,3 +469,8 @@ exports.syncAllSuppliersProductCounts = async (req, res) => {
         res.json({ success: true, message: "Counters synchronized successfully!" });
     } catch (e) { res.status(500).json({ message: "Sync Failed: " + e.message }); }
 };
+
+// Log diagnostic keys on startup
+console.log("====================================");
+console.log("🔍 [SJ10 DB Diagnostic] Loaded backend with database fallbacks.");
+console.log("====================================");

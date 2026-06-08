@@ -38,6 +38,7 @@ const pools = {
     social: createPool(process.env.DB_SOCIAL_URL),
     sku_master: createPool(process.env.DB_SKU_URL),       
     products_backup: createPool(process.env.DB_BACKUP_URL),
+    products: createPool(process.env.DB_INVENTORY_URL),
 
     testAllConnections: async () => {
         console.log("Testing Carts Database Connections...");
