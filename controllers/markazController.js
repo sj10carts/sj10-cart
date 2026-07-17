@@ -1,7 +1,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const db = require('../config/database'); 
-const { clients } = require('../config/tursoConnection'); 
+
 const { v4: uuidv4 } = require('uuid');
 const sharp = require('sharp');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -296,18 +296,18 @@ exports.scrapeMarkaz = async (req, res) => {
     }
 };
 
-// 3. SAVE PRODUCT
+// 3. SAVE PRODUCT (ORACLE POSTGRES)
 exports.saveProduct = async (req, res) => {
-    const { title, sku, images, variants, shardKey, selectedSupplierId, salePrice, cutPrice, categoryId, description } = req.body;
+    const { title, sku, images, variants, selectedSupplierId, salePrice, cutPrice, categoryId, description } = req.body;
     
     console.log(`\n============================================`);
-    console.log(`🚀 [Save] PROCESS STARTED | SKU: ${sku}`);
+    console.log(`🚀 [ORACLE SAVE] PROCESS STARTED | SKU: ${sku}`);
     console.log(`============================================`);
 
     try {
         const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
-        const client = clients[shardKey] || clients.shard_general;
 
+        // Step 0: Check duplicate in Sku Master (TiDB)
         if (db.sku_master) {
             console.log(`   Step 0: Checking duplicate for SKU: ${sku}...`);
             const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
@@ -317,6 +317,7 @@ exports.saveProduct = async (req, res) => {
             }
         }
 
+        // Step 1: Compress & Upload Images to R2
         console.log(`   Step 1: Processing ${images?.length || 0} Images...`);
         const imageList = (images || []).slice(0, 4);
         
@@ -329,36 +330,47 @@ exports.saveProduct = async (req, res) => {
         }
         console.log(`   ✅ Step 1 Done: ${uploadedUrls.length} images ready.`);
 
-        console.log(`   Step 2: Inserting Product into Turso Shard [${shardKey}]...`);
+        // Step 2: 🚨 INSERT INTO ORACLE POSTGRES
+        console.log(`   Step 2: Inserting Product into Oracle Database...`);
         const newId = uuidv4();
         const slug = (title || "prod").toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
 
-        await client.execute({
-            sql: `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at, package_information, imported_region) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            args: [
-                newId, supplierToSave, categoryId || null, title, 
-                description || "Premium Quality Product", 
-                cutPrice || Math.round(salePrice * 1.2), salePrice, 100, 'in_stock', sku, slug,
-                JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString(), "20x20x10 cm, 0.5kg", "Pakistan"
-            ]
-        });
-        console.log(`   ✅ Step 2 Done: Main product row created.`);
+        const productSql = `
+            INSERT INTO products (
+                id, supplier_id, category_id, title, description, price, discounted_price, quantity, 
+                status, sku, slug, image_urls, image_url, created_at, package_information, imported_region
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        `;
 
+        await db.oracle.query(productSql, [
+            newId, supplierToSave, categoryId || null, title, 
+            description || "Premium Quality Product", 
+            cutPrice || Math.round(salePrice * 1.2), salePrice, 100, 'in_stock', sku, slug,
+            JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString(), "20x20x10 cm, 0.5kg", "Pakistan"
+        ]);
+        console.log(`   ✅ Step 2 Done: Main product row created in Oracle.`);
+
+        // Step 3: 🚨 INSERT VARIANTS INTO ORACLE POSTGRES (Parallel Execution)
         if (variants && variants.length > 0) {
-            console.log(`   Step 3: Batch Inserting ${variants.length} Variants...`);
-            const variantQueries = variants.map(v => {
+            console.log(`   Step 3: Inserting ${variants.length} Variants into Oracle...`);
+            
+            const variantPromises = variants.map(v => {
                 const cS = v.color ? v.color.substring(0,3).toUpperCase() : 'DEF';
                 const sS = v.size ? v.size.substring(0,3).toUpperCase() : 'STD';
                 const vSku = `${sku}-${cS}-${sS}`;
-                return {
-                    sql: `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, is_custom, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    args: [uuidv4(), newId, v.color || null, v.size || null, v.price || salePrice, 100, vSku, 1, uploadedUrls[0]]
-                };
+                
+                return db.oracle.query(
+                    `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, is_custom, image_url) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                    [uuidv4(), newId, v.color || null, v.size || null, v.price || salePrice, 100, vSku, 1, uploadedUrls[0]]
+                );
             });
-            await client.batch(variantQueries, "write");
-            console.log(`   ✅ Step 3 Done: Variants created.`);
+
+            await Promise.all(variantPromises);
+            console.log(`   ✅ Step 3 Done: Variants created in Oracle.`);
         }
 
+        // Step 4: Register in Sku Master (TiDB MySQL)
         if (db.sku_master) {
             console.log(`   Step 4: Registering in Sku Master...`);
             await db.sku_master.query(
@@ -368,32 +380,32 @@ exports.saveProduct = async (req, res) => {
         }
 
         console.log(`============================================`);
-        console.log(`✅ [Save] ALL STEPS SUCCESSFUL!`);
+        console.log(`✅ [Save] ALL STEPS SUCCESSFUL IN ORACLE!`);
         console.log(`============================================`);
         
         res.json({ success: true, sku });
 
     } catch (e) {
-        console.error(`\n💥 [Save] FATAL CRASH at Step:`, e.message);
+        console.error(`\n💥 [Save] FATAL CRASH:`, e.message);
         res.status(500).json({ message: e.message });
     }
 };
 
-// 4. BULK SAVE
+// 4. BULK SAVE (ORACLE POSTGRES)
 exports.bulkSaveProducts = async (req, res) => {
     try {
-        const { products, categoryId, shardKey, selectedSupplierId } = req.body;
-        const client = clients[shardKey] || clients.shard_general;
+        const { products, categoryId, selectedSupplierId } = req.body;
         const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
         const savedSkus = [];
 
         console.log(`\n============================================`);
-        console.log(`🚀 [Bulk Save] Started for ${products.length} Products`);
+        console.log(`🚀 [Bulk Save] Started for ${products.length} Products in Oracle`);
         console.log(`============================================`);
 
         for (const prod of products) {
             const { title, salePrice, sku, images, variants } = prod;
             
+            // Check Duplicate
             if (db.sku_master) {
                 const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
                 if (existing && existing.length > 0) {
@@ -412,24 +424,32 @@ exports.bulkSaveProducts = async (req, res) => {
 
             const newId = uuidv4();
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+            
             try {
-                await client.execute({
-                    sql: `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    args: [
+                // 🚨 Oracle Postgres Insert
+                await db.oracle.query(
+                    `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+                    [
                         newId, supplierToSave, categoryId, title, "Premium Product", 
                         salePrice + 200, salePrice, 100, 'in_stock', sku, slug, 
                         JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString()
                     ]
-                });
+                );
 
+                // Insert Variants
                 if (variants && variants.length > 0) {
-                    const variantQueries = variants.map(v => ({
-                        sql: `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                        args: [uuidv4(), newId, v.color, v.size, v.price || salePrice, 100, `${sku}-VAR`, uploadedUrls[0]]
-                    }));
-                    await client.batch(variantQueries, "write");
+                    const variantPromises = variants.map(v => 
+                        db.oracle.query(
+                            `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, image_url) 
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                            [uuidv4(), newId, v.color, v.size, v.price || salePrice, 100, `${sku}-VAR`, uploadedUrls[0]]
+                        )
+                    );
+                    await Promise.all(variantPromises);
                 }
                 
+                // Register SKU Master
                 if (db.sku_master) {
                     await db.sku_master.query(
                         "INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", 
@@ -438,12 +458,16 @@ exports.bulkSaveProducts = async (req, res) => {
                 }
 
                 savedSkus.push(sku);
-                console.log(`✅ [Bulk] Saved: ${sku} (${variants.length} vars)`);
-            } catch (err) { console.error(`❌ [Bulk] DB Fail: ${title}`, err.message); }
+                console.log(`✅ [Bulk] Saved to Oracle: ${sku}`);
+            } catch (err) { 
+                console.error(`❌ [Bulk] DB Fail: ${title}`, err.message); 
+            }
         }
 
         res.json({ success: true, savedCount: savedSkus.length });
-    } catch (e) { res.status(500).json({ message: e.message }); }
+    } catch (e) { 
+        res.status(500).json({ message: e.message }); 
+    }
 };
 
 exports.getTeam = async (req, res) => {
@@ -453,21 +477,36 @@ exports.getTeam = async (req, res) => {
     } catch (e) { res.status(500).json({ message: "Error" }); }
 };
 
+// 5. GLOBAL COUNTER SYNC (ORACLE POSTGRES)
 exports.syncAllSuppliersProductCounts = async (req, res) => {
     try {
-        const [suppliers] = await db.suppliers.query("SELECT id FROM suppliers");
-        for (const supplier of suppliers) {
-            let totalProductsCount = 0;
-            for (const shardKey in clients) {
-                try {
-                    const result = await clients[shardKey].execute({ sql: "SELECT COUNT(*) as count FROM products WHERE supplier_id = ?", args: [supplier.id] });
-                    if (result && result.rows && result.rows[0]) totalProductsCount += parseInt(result.rows[0].count || 0);
-                } catch (e) {}
+        console.log("🟢 [ORACLE DB] Starting global supplier products count sync...");
+        
+        // Postgres Group By Query (Extremely fast, takes milliseconds)
+        const result = await db.oracle.query(
+            "SELECT supplier_id, COUNT(*) as total_count FROM products GROUP BY supplier_id"
+        );
+
+        // Update TiDB MySQL in parallel
+        const syncPromises = result.rows.map(row => {
+            if (row.supplier_id) {
+                return db.suppliers.execute(
+                    "UPDATE suppliers SET total_products = ? WHERE id = ?", 
+                    [parseInt(row.total_count), row.supplier_id]
+                );
             }
-            await db.suppliers.execute("UPDATE suppliers SET total_products = ? WHERE id = ?", [totalProductsCount, supplier.id]);
-        }
+            return null;
+        }).filter(Boolean);
+
+        await Promise.all(syncPromises);
+
+        console.log("✅ [ORACLE DB] Global counts synchronized successfully!");
         res.json({ success: true, message: "Counters synchronized successfully!" });
-    } catch (e) { res.status(500).json({ message: "Sync Failed: " + e.message }); }
+
+    } catch (e) { 
+        console.error("🔴 Sync Failed:", e.message);
+        res.status(500).json({ message: "Sync Failed: " + e.message }); 
+    }
 };
 
 // Log diagnostic keys on startup

@@ -1,10 +1,10 @@
-// sj cart git/config/database.js
+// config/database.js
 require('dotenv').config();
 const mysql = require('mysql2/promise');
+const { Pool } = require('pg'); // 🚨 PostgreSQL Driver
 const { URL } = require('url');
 
 const createPool = (connectionUrl) => {
-    // 🟢 FIXED: Crash-free validation for Vercel Serverless environment
     if (!connectionUrl || connectionUrl.trim() === '' || connectionUrl.includes('undefined')) {
         console.warn(`⚠️ DB connection URL is missing or malformed. Skipping pool creation.`);
         return null;
@@ -16,7 +16,7 @@ const createPool = (connectionUrl) => {
             user: url.username, 
             password: url.password,
             database: url.pathname.substring(1), 
-            port: url.port || 3306,
+            port: url.port || 4000,
             ssl: { rejectUnauthorized: true },
             waitForConnections: true, 
             connectionLimit: 5, 
@@ -25,12 +25,19 @@ const createPool = (connectionUrl) => {
             enableKeepAlive: true
         });
     } catch (error) { 
-        console.error(`🔴 DB Config Error for ${connectionUrl}:`, error.message);
+        console.error(`🔴 DB Config Error:`, error.message);
         return null;
     }
 };
 
 const pools = {
+    // 🟢 ORACLE POSTGRES POOL (New Database)
+    oracle: new Pool({
+        connectionString: process.env.DB_ORACLE_PRODUCTS_URL,
+        ssl: { rejectUnauthorized: false } // Vercel Serverless safe setting
+    }),
+
+    // 🟡 TiDB MYSQL POOLS
     carts: createPool(process.env.DB_CARTS_URL),
     inventory: createPool(process.env.DB_INVENTORY_URL),
     suppliers: createPool(process.env.DB_SUPPLIERS_URL),
@@ -42,18 +49,26 @@ const pools = {
 
     testAllConnections: async () => {
         console.log("Testing Carts Database Connections...");
-        const keys = Object.keys(pools);
-        for (const key of keys) {
-            if (key === 'testAllConnections') continue;
-            if (pools[key]) {
-                try {
-                    const conn = await pools[key].getConnection();
-                    await conn.ping();
-                    conn.release();
-                    console.log(`✅ Carts connected to [${key}] DB.`);
-                } catch (e) { 
-                    console.error(`🔴 Failed to connect to [${key}]:`, e.message); 
-                }
+        
+        // Test Oracle
+        if (pools.oracle) {
+            try {
+                const client = await pools.oracle.connect();
+                console.log("✅ Carts connected to [Oracle Postgres] Products.");
+                client.release();
+            } catch (e) {
+                console.error("🔴 Failed to connect to Oracle Postgres:", e.message);
+            }
+        }
+
+        // Test TiDB
+        if (pools.carts) {
+            try {
+                const conn = await pools.carts.getConnection();
+                console.log("✅ Carts connected to [MySQL Carts] DB.");
+                conn.release();
+            } catch (e) {
+                console.error("🔴 Failed to connect to MySQL Carts:", e.message);
             }
         }
     }
