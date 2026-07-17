@@ -15,7 +15,8 @@ const productCardRoutes = require('../routes/productCardRoutes');
 const markazRoutes = require('../routes/markazRoutes'); 
 
 const app = express();
-
+// 🚨 ADD THIS LINE RIGHT HERE (Nginx/Cloudflare ke real IPs trust karne ke liye) 🚨
+app.set('trust proxy', 1); // 1 means trust the first proxy
 // =========================================================================
 // 🛡️ 1. SECURITY HEADERS (HELMET)
 // =========================================================================
