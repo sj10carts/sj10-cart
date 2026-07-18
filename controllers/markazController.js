@@ -8,6 +8,14 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const s3Client = require('../config/s3Client'); 
 const https = require('https');
 
+const redis = require('../config/redis'); // 🚨 Redis connection
+const meiliPkg = require('meilisearch'); // 🚨 Meilisearch connection
+const MeiliSearch = meiliPkg.Meilisearch || meiliPkg.MeiliSearch || meiliPkg.default || meiliPkg;
+
+const meiliClient = new MeiliSearch({
+    host: 'http://129.159.225.126:7700',
+    apiKey: 'Sj10MeiliSuperKey2026'
+});
 // Optimized HTTPS Agent for persistent connections (Fast Scrape/Image Download)
 const httpsAgent = new https.Agent({ 
     keepAlive: true, 
@@ -296,177 +304,179 @@ exports.scrapeMarkaz = async (req, res) => {
     }
 };
 
-// 3. SAVE PRODUCT (ORACLE POSTGRES)
+// 3. SAVE PRODUCT (ORACLE READY + STRICT DUPLICATION LOCK)
 exports.saveProduct = async (req, res) => {
-    const { title, sku, images, variants, selectedSupplierId, salePrice, cutPrice, categoryId, description } = req.body;
+    const { 
+        title, sku, images, variants, selectedSupplierId, 
+        salePrice, cutPrice, categoryId, description, 
+        markaz_product_code // 🚨 Ensure frontend sends this
+    } = req.body;
     
     console.log(`\n============================================`);
-    console.log(`🚀 [ORACLE SAVE] PROCESS STARTED | SKU: ${sku}`);
+    console.log(`🚀 [ORACLE SAVE] STARTING | SKU: ${sku} | Markaz: ${markaz_product_code}`);
     console.log(`============================================`);
 
     try {
-        const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
+        const supplierId = selectedSupplierId || req.supplier?.id || "0-0-0-0";
 
-        // Step 0: Check duplicate in Sku Master (TiDB)
-        if (db.sku_master) {
-            console.log(`   Step 0: Checking duplicate for SKU: ${sku}...`);
-            const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
-            if (existing && existing.length > 0) {
-                console.warn(`   ⚠️ [Save] ABORTED: Product with SKU ${sku} already exists.`);
-                return res.status(400).json({ message: "Duplicate Entry! Product is already saved." });
+        // --- STEP 0: STRICT DUPLICATION CHECKS ---
+        
+        // A. Check Markaz Code in Oracle Postgres
+        if (markaz_product_code) {
+            const checkMarkaz = await db.oracle.query("SELECT id FROM products WHERE markaz_code = $1 LIMIT 1", [markaz_product_code]);
+            if (checkMarkaz.rows.length > 0) {
+                console.warn(`⚠️ [Save] ABORTED: Markaz Code ${markaz_product_code} already exists.`);
+                return res.status(400).json({ message: "This Markaz product is already in our system!" });
             }
         }
 
-        // Step 1: Compress & Upload Images to R2
-        console.log(`   Step 1: Processing ${images?.length || 0} Images...`);
+        // B. Check SKU in TiDB Sku Master
+        const [existingSku] = await db.sku_master.query("SELECT id FROM sku_views WHERE sku = ?", [sku]);
+        if (existingSku && existingSku.length > 0) {
+            console.warn(`⚠️ [Save] ABORTED: SKU ${sku} already exists in Central Master.`);
+            return res.status(400).json({ message: "SKU already exists. Please use a unique SKU." });
+        }
+
+        // --- STEP 1: IMAGE PROCESSING ---
+        console.log(`📸 [Step 1] Processing ${images?.length || 0} Images...`);
         const imageList = (images || []).slice(0, 4);
-        
         const uploadPromises = imageList.map((img, idx) => processAndUploadRemoteImage(img, sku, idx + 1));
         const uploadedUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
 
         if (uploadedUrls.length === 0) {
-            console.error(`   ❌ [Save] ABORTED: No images were successful.`);
-            return res.status(400).json({ message: "Image upload failed." });
+            return res.status(400).json({ message: "Image upload failed. Cannot save product." });
         }
-        console.log(`   ✅ Step 1 Done: ${uploadedUrls.length} images ready.`);
 
-        // Step 2: 🚨 INSERT INTO ORACLE POSTGRES
-        console.log(`   Step 2: Inserting Product into Oracle Database...`);
         const newId = uuidv4();
         const slug = (title || "prod").toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
+        const now = new Date().toISOString();
 
+        // --- STEP 2: INSERT INTO ORACLE POSTGRES ---
+        console.log(`🗄️ [Step 2] Inserting Main Product into Oracle...`);
         const productSql = `
             INSERT INTO products (
                 id, supplier_id, category_id, title, description, price, discounted_price, quantity, 
-                status, sku, slug, image_urls, image_url, created_at, package_information, imported_region
+                status, sku, slug, image_urls, image_url, created_at, markaz_code, imported_region
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         `;
 
         await db.oracle.query(productSql, [
-            newId, supplierToSave, categoryId || null, title, 
+            newId, supplierId, categoryId || null, title, 
             description || "Premium Quality Product", 
-            cutPrice || Math.round(salePrice * 1.2), salePrice, 100, 'in_stock', sku, slug,
-            JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString(), "20x20x10 cm, 0.5kg", "Pakistan"
+            parseFloat(cutPrice || salePrice * 1.2), parseFloat(salePrice), 100, 'in_stock', sku, slug,
+            JSON.stringify(uploadedUrls), uploadedUrls[0], now, markaz_product_code, "Pakistan"
         ]);
-        console.log(`   ✅ Step 2 Done: Main product row created in Oracle.`);
 
-        // Step 3: 🚨 INSERT VARIANTS INTO ORACLE POSTGRES (Parallel Execution)
+        // --- STEP 3: INSERT VARIANTS ---
         if (variants && variants.length > 0) {
-            console.log(`   Step 3: Inserting ${variants.length} Variants into Oracle...`);
-            
-            const variantPromises = variants.map(v => {
-                const cS = v.color ? v.color.substring(0,3).toUpperCase() : 'DEF';
-                const sS = v.size ? v.size.substring(0,3).toUpperCase() : 'STD';
-                const vSku = `${sku}-${cS}-${sS}`;
-                
-                return db.oracle.query(
+            console.log(`🧬 [Step 3] Batch Inserting ${variants.length} Variants...`);
+            const variantPromises = variants.map(v => 
+                db.oracle.query(
                     `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, is_custom, image_url) 
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-                    [uuidv4(), newId, v.color || null, v.size || null, v.price || salePrice, 100, vSku, 1, uploadedUrls[0]]
-                );
-            });
-
+                    [uuidv4(), newId, v.color || null, v.size || null, parseFloat(v.price) || salePrice, 100, `${sku}-VAR`, 1, uploadedUrls[0]]
+                )
+            );
             await Promise.all(variantPromises);
-            console.log(`   ✅ Step 3 Done: Variants created in Oracle.`);
         }
 
-        // Step 4: Register in Sku Master (TiDB MySQL)
-        if (db.sku_master) {
-            console.log(`   Step 4: Registering in Sku Master...`);
-            await db.sku_master.query(
-                "INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", 
-                [uuidv4(), newId, sku, slug]
-            ).catch(e => console.log("   ⚠️ Sku Master Error:", e.message));
-        }
+        // --- STEP 4: SYNC SEARCH ENGINE (MEILISEARCH) ---
+        try {
+            console.log(`🏎️ [Step 4] Pushing to Meilisearch...`);
+            await meiliClient.index('products').addDocuments([{
+                id: newId, title, slug, sku, description,
+                price: parseFloat(salePrice), discounted_price: parseFloat(salePrice), created_at: now
+            }]);
+        } catch (meiliErr) { console.error("⚠️ [MEILI] Sync Warning:", meiliErr.message); }
 
-        console.log(`============================================`);
-        console.log(`✅ [Save] ALL STEPS SUCCESSFUL IN ORACLE!`);
-        console.log(`============================================`);
-        
-        res.json({ success: true, sku });
+        // --- STEP 5: HOUSEKEEPING (TiDB & Redis) ---
+        await db.sku_master.query("INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", [uuidv4(), newId, sku, slug]);
+        await db.suppliers.execute("UPDATE suppliers SET total_products = total_products + 1 WHERE id = ?", [supplierId]);
+        await redis.del("homepage_master_cache_v5"); // Clear Homepage Cache
+
+        console.log(`✅ [SUCCESS] Product Saved Globally! SKU: ${sku}`);
+        res.json({ success: true, sku, slug });
 
     } catch (e) {
-        console.error(`\n💥 [Save] FATAL CRASH:`, e.message);
-        res.status(500).json({ message: e.message });
+        console.error(`💥 [FATAL ERROR]:`, e.message);
+        res.status(500).json({ message: "Internal Database Error" });
     }
 };
-
-// 4. BULK SAVE (ORACLE POSTGRES)
+// 4. BULK SAVE (ORACLE + BATCH SYNC + DUPE PROTECTION)
 exports.bulkSaveProducts = async (req, res) => {
+    const { products, categoryId, selectedSupplierId } = req.body;
+    const supplierId = selectedSupplierId || req.supplier?.id || "0-0-0-0";
+    
+    console.log(`\n============================================`);
+    console.log(`🚀 [BULK SAVE] STARTING for ${products.length} Products`);
+    console.log(`============================================`);
+
+    const savedSkus = [];
+    const meiliDocs = [];
+
     try {
-        const { products, categoryId, selectedSupplierId } = req.body;
-        const supplierToSave = selectedSupplierId || req.supplier?.id || "00000000-0000-0000-0000-000000000000";
-        const savedSkus = [];
-
-        console.log(`\n============================================`);
-        console.log(`🚀 [Bulk Save] Started for ${products.length} Products in Oracle`);
-        console.log(`============================================`);
-
         for (const prod of products) {
-            const { title, salePrice, sku, images, variants } = prod;
-            
-            // Check Duplicate
-            if (db.sku_master) {
-                const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [sku]);
-                if (existing && existing.length > 0) {
-                    console.warn(`❌ [Bulk] Skipped "${title}" - SKU ${sku} already exists.`);
-                    continue; 
-                }
-            }
+            const { title, salePrice, sku, images, markaz_product_code } = prod;
 
-            const uploadPromises = images.slice(0, 4).map((img, idx) => processAndUploadRemoteImage(img, sku, idx + 1));
-            const uploadedUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
-
-            if (uploadedUrls.length === 0) {
-                console.error(`❌ [Bulk] Skipped "${title}" - No images processed.`);
+            // 1. Strict Duplicate Pre-Check
+            const checkDupe = await db.oracle.query("SELECT id FROM products WHERE markaz_code = $1 OR sku = $2 LIMIT 1", [markaz_product_code, sku]);
+            if (checkDupe.rows.length > 0) {
+                console.log(`⏭️ [Bulk] Skipping Duplicate: ${sku} / ${markaz_product_code}`);
                 continue; 
             }
 
+            // 2. Image Processing
+            const uploadPromises = images.slice(0, 4).map((img, idx) => processAndUploadRemoteImage(img, sku, idx + 1));
+            const uploadedUrls = (await Promise.all(uploadPromises)).filter(url => url !== null);
+            if (uploadedUrls.length === 0) continue;
+
             const newId = uuidv4();
-            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-            
+            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
+            const now = new Date().toISOString();
+
             try {
-                // 🚨 Oracle Postgres Insert
+                // 3. Oracle Insert
                 await db.oracle.query(
-                    `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at) 
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-                    [
-                        newId, supplierToSave, categoryId, title, "Premium Product", 
-                        salePrice + 200, salePrice, 100, 'in_stock', sku, slug, 
-                        JSON.stringify(uploadedUrls), uploadedUrls[0], new Date().toISOString()
-                    ]
+                    `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at, markaz_code) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+                    [newId, supplierId, categoryId, title, "Premium Quality", parseFloat(salePrice * 1.2), parseFloat(salePrice), 100, 'in_stock', sku, slug, JSON.stringify(uploadedUrls), uploadedUrls[0], now, markaz_product_code]
                 );
 
-                // Insert Variants
-                if (variants && variants.length > 0) {
-                    const variantPromises = variants.map(v => 
-                        db.oracle.query(
-                            `INSERT INTO variants (id, product_id, custom_color, custom_size, price, stock, sku, image_url) 
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-                            [uuidv4(), newId, v.color, v.size, v.price || salePrice, 100, `${sku}-VAR`, uploadedUrls[0]]
-                        )
-                    );
-                    await Promise.all(variantPromises);
-                }
-                
-                // Register SKU Master
-                if (db.sku_master) {
-                    await db.sku_master.query(
-                        "INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", 
-                        [uuidv4(), newId, sku, slug]
-                    ).catch(e => console.log("   ⚠️ Sku Master Error:", e.message));
-                }
+                // 4. Prepare for Meilisearch Batch
+                meiliDocs.push({
+                    id: newId, title, slug, sku, price: parseFloat(salePrice), 
+                    discounted_price: parseFloat(salePrice), created_at: now
+                });
 
+                // 5. Reserve in SKU Master (TiDB)
+                await db.sku_master.query("INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", [uuidv4(), newId, sku, slug]);
+                
                 savedSkus.push(sku);
-                console.log(`✅ [Bulk] Saved to Oracle: ${sku}`);
-            } catch (err) { 
-                console.error(`❌ [Bulk] DB Fail: ${title}`, err.message); 
+                console.log(`✅ [Bulk] Saved: ${sku}`);
+
+            } catch (innerErr) {
+                console.error(`❌ [Bulk] Failed item ${sku}:`, innerErr.message);
             }
         }
 
+        // --- FINAL BATCH SYNC ---
+        if (meiliDocs.length > 0) {
+            console.log(`🏎️ [Bulk] Batch indexing ${meiliDocs.length} items in Meilisearch...`);
+            await meiliClient.index('products').addDocuments(meiliDocs);
+        }
+
+        // Update Supplier Total Count & Flush Cache
+        if (savedSkus.length > 0) {
+            await db.suppliers.execute("UPDATE suppliers SET total_products = total_products + ? WHERE id = ?", [savedSkus.length, supplierId]);
+            await redis.del("homepage_master_cache_v5");
+        }
+
+        console.log(`🏁 [BULK COMPLETE] Saved: ${savedSkus.length} / Total: ${products.length}`);
         res.json({ success: true, savedCount: savedSkus.length });
-    } catch (e) { 
-        res.status(500).json({ message: e.message }); 
+
+    } catch (e) {
+        console.error(`💥 [Bulk Fatal]:`, e.message);
+        res.status(500).json({ message: "Bulk operation failed." });
     }
 };
 
@@ -480,14 +490,13 @@ exports.getTeam = async (req, res) => {
 // 5. GLOBAL COUNTER SYNC (ORACLE POSTGRES)
 exports.syncAllSuppliersProductCounts = async (req, res) => {
     try {
-        console.log("🟢 [ORACLE DB] Starting global supplier products count sync...");
+        console.log("🟢 [ORACLE DB] Syncing global supplier product counters...");
         
-        // Postgres Group By Query (Extremely fast, takes milliseconds)
+        // Single Group By Query in Postgres (Lightning Fast)
         const result = await db.oracle.query(
             "SELECT supplier_id, COUNT(*) as total_count FROM products GROUP BY supplier_id"
         );
 
-        // Update TiDB MySQL in parallel
         const syncPromises = result.rows.map(row => {
             if (row.supplier_id) {
                 return db.suppliers.execute(
@@ -499,16 +508,9 @@ exports.syncAllSuppliersProductCounts = async (req, res) => {
         }).filter(Boolean);
 
         await Promise.all(syncPromises);
-
-        console.log("✅ [ORACLE DB] Global counts synchronized successfully!");
-        res.json({ success: true, message: "Counters synchronized successfully!" });
-
-    } catch (e) { 
-        console.error("🔴 Sync Failed:", e.message);
-        res.status(500).json({ message: "Sync Failed: " + e.message }); 
-    }
+        res.json({ success: true, message: "Counters synced via Oracle Postgres!" });
+    } catch (e) { res.status(500).json({ message: "Sync Failed: " + e.message }); }
 };
-
 // Log diagnostic keys on startup
 console.log("====================================");
 console.log("🔍 [SJ10 DB Diagnostic] Loaded backend with database fallbacks.");
