@@ -44,7 +44,30 @@ const createSJ10LogoSVG = (productWidth) => {
         </svg>
     `);
 };
+// 🚨 HELPER FUNCTION: Guaranteed Unique SKU Generator (Oracle DB Only)
+const getGuaranteedUniqueSku = async (markazCodeId) => {
+    // Start with basic Markaz ID or timestamp
+    const baseNumber = markazCodeId || Date.now().toString().slice(-6);
+    let newSku = `SJ10-${baseNumber}`;
+    let isUnique = false;
 
+    while (!isUnique) {
+        // Sirf Oracle DB mein check karega ke SKU pehle se tou nahi
+        const check = await db.oracle.query("SELECT id FROM products WHERE sku = $1 LIMIT 1", [newSku]);
+        
+        if (check.rows.length === 0) {
+            isUnique = true; // SKU Unique hai, loop khatam
+        } else {
+            // Agar SKU duplicate hai tou aage 4 random digits chipka dega (Bina extra dash ke)
+            // Example: SJ10-659155 duplicate hai tou SJ10-6591557382 ban jayega
+            const randomDigits = Math.floor(1000 + Math.random() * 9000).toString();
+            newSku = `SJ10-${baseNumber}${randomDigits}`;
+            console.log(`🔄 SKU Collision fixed! New SKU generated: ${newSku}`);
+        }
+    }
+    
+    return newSku;
+};
 // Filters out generic platform and marketplace marketing boilerplate
 const isBoilerplate = (text) => {
     const lower = text.toLowerCase();
@@ -162,18 +185,19 @@ exports.scrapeMarkaz = async (req, res) => {
             return res.json({ categories });
         }
 
-        // --- NORMAL SCRAPER CODE ---
-        const markazCodeId = (url.match(/\/(\d+)$/) || ["", ""])[1];
-        const generatedSku = `SJ10-${markazCodeId || Date.now().toString().slice(-6)}`;
+      const markazCodeId = (url.match(/\/(\d+)$/) || ["", ""])[1];
 
-        // Check Duplicate first
-        if (db.sku_master) {
-            const [existing] = await db.sku_master.query("SELECT sku FROM sku_views WHERE sku = ?", [generatedSku]);
-            if (existing && existing.length > 0) {
-                console.log(`⚠️ [Scraper] Duplicate detected: ${generatedSku}`);
+        // 1. Real Duplicate Check: Kya Markaz Code pehle se Oracle DB mein hai?
+        if (markazCodeId) {
+            const checkMarkaz = await db.oracle.query("SELECT id FROM products WHERE markaz_code = $1 LIMIT 1", [markazCodeId]);
+            if (checkMarkaz.rows.length > 0) {
+                console.log(`⚠️ [Scraper] Real Duplicate Markaz Code: ${markazCodeId}`);
                 return res.status(400).json({ message: "Product already exists in system", isDuplicate: true });
             }
         }
+
+        // 2. Safe Unique SKU Generator (Format: SJ10-RandomNumber)
+        const generatedSku = await getGuaranteedUniqueSku(markazCodeId);
 
         const categories = await fetchAllCategories();
         
@@ -304,21 +328,22 @@ exports.scrapeMarkaz = async (req, res) => {
     }
 };
 
-// 3. SAVE PRODUCT (ORACLE READY + STRICT DUPLICATION LOCK)
 exports.saveProduct = async (req, res) => {
     const { 
-        title, sku, images, variants, selectedSupplierId, 
+        title, sku, images, variants, selectedSupplierId, supplierId, supplier_id, 
         salePrice, cutPrice, categoryId, description, 
-        markaz_product_code // 🚨 Ensure frontend sends this
+        markaz_product_code
     } = req.body;
     
+    // 🚨 HARDCODED DEFAULT SUPPLIER ID (Agar frontend/token se na mile tou yeh use hogi)
+    const DEFAULT_SUPPLIER_ID = "854ee7de-425b-4057-a8f7-eb310491c6b0";
+    const finalSupplierId = supplierId || supplier_id || selectedSupplierId || req.user?.id || req.supplier?.id || DEFAULT_SUPPLIER_ID;
+
     console.log(`\n============================================`);
-    console.log(`🚀 [ORACLE SAVE] STARTING | SKU: ${sku} | Markaz: ${markaz_product_code}`);
+    console.log(`🚀 [ORACLE SAVE] STARTING | SKU: ${sku} | Markaz: ${markaz_product_code} | Supplier: ${finalSupplierId}`);
     console.log(`============================================`);
 
     try {
-        const supplierId = selectedSupplierId || req.supplier?.id || "0-0-0-0";
-
         // --- STEP 0: STRICT DUPLICATION CHECKS ---
         
         // A. Check Markaz Code in Oracle Postgres
@@ -330,12 +355,7 @@ exports.saveProduct = async (req, res) => {
             }
         }
 
-        // B. Check SKU in TiDB Sku Master
-        const [existingSku] = await db.sku_master.query("SELECT id FROM sku_views WHERE sku = ?", [sku]);
-        if (existingSku && existingSku.length > 0) {
-            console.warn(`⚠️ [Save] ABORTED: SKU ${sku} already exists in Central Master.`);
-            return res.status(400).json({ message: "SKU already exists. Please use a unique SKU." });
-        }
+        // B. (Agar Oracle Database mein manually sku unique check lagaya hua hai tou aap woh helper use kar sakte hain)
 
         // --- STEP 1: IMAGE PROCESSING ---
         console.log(`📸 [Step 1] Processing ${images?.length || 0} Images...`);
@@ -360,8 +380,9 @@ exports.saveProduct = async (req, res) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         `;
 
+        // 🚨 Yahan $2 mein `finalSupplierId` paas ho raha hai taake exact ID Oracle mein save ho
         await db.oracle.query(productSql, [
-            newId, supplierId, categoryId || null, title, 
+            newId, finalSupplierId, categoryId || null, title, 
             description || "Premium Quality Product", 
             parseFloat(cutPrice || salePrice * 1.2), parseFloat(salePrice), 100, 'in_stock', sku, slug,
             JSON.stringify(uploadedUrls), uploadedUrls[0], now, markaz_product_code, "Pakistan"
@@ -390,9 +411,16 @@ exports.saveProduct = async (req, res) => {
         } catch (meiliErr) { console.error("⚠️ [MEILI] Sync Warning:", meiliErr.message); }
 
         // --- STEP 5: HOUSEKEEPING (TiDB & Redis) ---
-        await db.sku_master.query("INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", [uuidv4(), newId, sku, slug]);
-        await db.suppliers.execute("UPDATE suppliers SET total_products = total_products + 1 WHERE id = ?", [supplierId]);
-        await redis.del("homepage_master_cache_v5"); // Clear Homepage Cache
+        // SKU views insert (agar aapka tidb chal raha hai tou)
+        if (db.sku_master) {
+            await db.sku_master.query("INSERT INTO sku_views (id, product_id, sku, slug, views) VALUES (?, ?, ?, ?, 0)", [uuidv4(), newId, sku, slug]).catch(e=>console.log(e.message));
+        }
+        
+        // Supplier products count update
+        await db.suppliers.execute("UPDATE suppliers SET total_products = total_products + 1 WHERE id = ?", [finalSupplierId]).catch(e=>console.log(e.message));
+        
+        // Cache clear
+        await redis.del("homepage_master_cache_v5"); 
 
         console.log(`✅ [SUCCESS] Product Saved Globally! SKU: ${sku}`);
         res.json({ success: true, sku, slug });
@@ -404,11 +432,14 @@ exports.saveProduct = async (req, res) => {
 };
 // 4. BULK SAVE (ORACLE + BATCH SYNC + DUPE PROTECTION)
 exports.bulkSaveProducts = async (req, res) => {
-    const { products, categoryId, selectedSupplierId } = req.body;
-    const supplierId = selectedSupplierId || req.supplier?.id || "0-0-0-0";
+    const { products, categoryId, selectedSupplierId, supplierId, supplier_id } = req.body;
+    
+    // 🚨 HARDCODED DEFAULT SUPPLIER ID
+    const DEFAULT_SUPPLIER_ID = "854ee7de-425b-4057-a8f7-eb310491c6b0";
+    const finalSupplierId = supplierId || supplier_id || selectedSupplierId || req.user?.id || req.supplier?.id || DEFAULT_SUPPLIER_ID;
     
     console.log(`\n============================================`);
-    console.log(`🚀 [BULK SAVE] STARTING for ${products.length} Products`);
+    console.log(`🚀 [BULK SAVE] STARTING for ${products.length} Products | Supplier: ${finalSupplierId}`);
     console.log(`============================================`);
 
     const savedSkus = [];
@@ -435,11 +466,11 @@ exports.bulkSaveProducts = async (req, res) => {
             const now = new Date().toISOString();
 
             try {
-                // 3. Oracle Insert
+                // 3. Oracle Insert (🚨 Yahan ab finalSupplierId use hoga)
                 await db.oracle.query(
                     `INSERT INTO products (id, supplier_id, category_id, title, description, price, discounted_price, quantity, status, sku, slug, image_urls, image_url, created_at, markaz_code) 
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-                    [newId, supplierId, categoryId, title, "Premium Quality", parseFloat(salePrice * 1.2), parseFloat(salePrice), 100, 'in_stock', sku, slug, JSON.stringify(uploadedUrls), uploadedUrls[0], now, markaz_product_code]
+                    [newId, finalSupplierId, categoryId, title, "Premium Quality", parseFloat(salePrice * 1.2), parseFloat(salePrice), 100, 'in_stock', sku, slug, JSON.stringify(uploadedUrls), uploadedUrls[0], now, markaz_product_code]
                 );
 
                 // 4. Prepare for Meilisearch Batch
@@ -465,9 +496,9 @@ exports.bulkSaveProducts = async (req, res) => {
             await meiliClient.index('products').addDocuments(meiliDocs);
         }
 
-        // Update Supplier Total Count & Flush Cache
+        // Update Supplier Total Count & Flush Cache (🚨 Yahan bhi finalSupplierId use hoga)
         if (savedSkus.length > 0) {
-            await db.suppliers.execute("UPDATE suppliers SET total_products = total_products + ? WHERE id = ?", [savedSkus.length, supplierId]);
+            await db.suppliers.execute("UPDATE suppliers SET total_products = total_products + ? WHERE id = ?", [savedSkus.length, finalSupplierId]);
             await redis.del("homepage_master_cache_v5");
         }
 
@@ -515,3 +546,139 @@ exports.syncAllSuppliersProductCounts = async (req, res) => {
 console.log("====================================");
 console.log("🔍 [SJ10 DB Diagnostic] Loaded backend with database fallbacks.");
 console.log("====================================");
+
+// =========================================================================
+// 🚨 NEW AUTOMATED SYNC ENGINE FOR AUTO-UPDATE (Oracle + Redis + Meili) 🚨
+// =========================================================================
+
+// 1. GET UNSYNCED PRODUCTS (SKIP LOCKED - Prevents Multi-Tab Conflict)
+exports.getUnsyncedProducts = async (req, res) => {
+    try {
+        console.log("🟢 [Oracle] Allocating 50 products with strict locking...");
+
+        // Select 50 oldest synced rows and lock them instantly for this thread
+        const lockQuery = `
+            UPDATE products
+            SET last_synced_at = NOW()
+            WHERE id IN (
+                SELECT id FROM products
+                WHERE status = 'in_stock' AND markaz_code IS NOT NULL
+                ORDER BY last_synced_at ASC NULLS FIRST
+                LIMIT 50
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, title, sku, markaz_code, markaz_url;
+        `;
+
+        const result = await db.oracle.query(lockQuery);
+        res.json(result.rows);
+    } catch (error) {
+        console.error("🔴 Get Unsynced Error:", error.message);
+        res.status(500).json([]);
+    }
+};
+
+// 2. SYNC SINGLE PRODUCT (Verify Stock & Price + Sync Meili/Redis/Variants)
+exports.updateSingleProduct = async (req, res) => {
+    try {
+        const { productId, markaz_code, currentUrl } = req.body;
+
+        if (!productId || !markaz_code) return res.status(400).json({ message: "Missing data" });
+
+        let targetUrl = currentUrl;
+        if (!targetUrl || targetUrl === 'null' || targetUrl.trim() === '') {
+            targetUrl = `https://www.markaz.app/shop/product/product/${markaz_code}`;
+        }
+
+        const { data: html } = await axios.get(targetUrl, { 
+            headers: { 'User-Agent': userAgents[0], 'Accept': 'text/html' },
+            httpsAgent: httpsAgent,
+            timeout: 10000 
+        });
+        const $ = cheerio.load(html);
+
+        let title = "", salePrice = 0, originalPrice = 0, description = "", inStock = true;
+
+        try {
+            const nextData = JSON.parse($('#__NEXT_DATA__').html());
+            const product = nextData?.props?.pageProps?.product || nextData?.props?.pageProps?.initialData?.product;
+            
+            if (product) {
+                title = product.title || "";
+                salePrice = parseInt(product.price || 0);
+                originalPrice = parseInt(product.oldPrice || 0);
+                description = product.description || product.longDescription || "";
+                // NextData stock check
+                inStock = product.status !== 'out_of_stock' && product.quantity > 0;
+            }
+        } catch (e) {}
+
+        if (!title) title = $('h1').first().text().trim();
+        if (!salePrice) {
+            const m = $('body').text().match(/PKR\s*([\d,]+)/i);
+            if (m) salePrice = parseInt(m[1].replace(/,/g, ''));
+        }
+        
+        // 🚨 THE CRITICAL FIX: Ignore disabled size chips. 🚨
+        // Only look at the main "Add to bag" or "Out of stock" action buttons.
+        const mainOutOfStockBtn = $('button').filter(function() {
+            const text = $(this).text().toLowerCase();
+            return text.includes('out of stock') || text.includes('sold out');
+        }).length > 0;
+
+        const buyBtnExists = $('button:contains("Add to bag"), button:contains("Buy now")').length > 0;
+
+        // If main out-of-stock button is active OR main buy buttons are missing entirely
+        if (mainOutOfStockBtn || (!buyBtnExists && title)) {
+            inStock = false;
+        }
+
+        if (!title || !salePrice) {
+            // Product deleted on Markaz, set to out of stock
+            await db.oracle.query("UPDATE products SET status = 'out_of_stock', quantity = 0, last_synced_at = NOW() WHERE id = $1", [productId]);
+            await db.oracle.query("UPDATE variants SET stock = 0 WHERE product_id = $1", [productId]); // Update variants
+            return res.json({ status: "DELETED_ON_MARKAZ", message: "Out of Stock" });
+        }
+
+        const calculatedStatus = inStock ? 'in_stock' : 'out_of_stock';
+        const calculatedQty = inStock ? 100 : 0;
+        const finalTitle = toTitleCase(title.replace(/ – Markaz| - Markaz App/ig, '').trim());
+
+     // 🚨 ONLY UPDATE PRICE & STOCK (Title, Description, and Images are 100% Protected!)
+        const updateSql = `
+            UPDATE products 
+            SET price = $1, discounted_price = $2, quantity = $3, status = $4, 
+                markaz_url = $5, last_synced_at = NOW() 
+            WHERE id = $6
+        `;
+
+        await db.oracle.query(updateSql, [
+            originalPrice || Math.round(salePrice * 1.2), 
+            salePrice, 
+            calculatedQty, 
+            calculatedStatus, 
+            targetUrl, 
+            productId
+        ]);
+
+        // B. 🧬 SYNC ALL VARIANTS' STOCK (TiDB & Oracle Postgres Sync)
+        // Agar main product out of stock ho jaye tou saare variants automatic 0 stock ho jayenge!
+        await db.oracle.query("UPDATE variants SET stock = $1 WHERE product_id = $2", [calculatedQty, productId]);
+
+        // C. Sync Meilisearch
+        try {
+            const slug = finalTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
+            await meiliClient.index('products').addDocuments([{
+                id: productId, title: finalTitle, slug, price: parseFloat(salePrice), discounted_price: parseFloat(salePrice)
+            }]);
+        } catch(e) {}
+
+        // D. Flush Redis
+        await redis.del("homepage_master_cache_v5");
+
+        res.json({ status: "SUCCESS", title: finalTitle, price: salePrice, stock: calculatedStatus });
+
+    } catch (error) {
+        res.status(500).json({ status: "FAILED", message: error.message });
+    }
+};
