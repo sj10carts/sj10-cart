@@ -1,5 +1,5 @@
-// api/checkProduct.js
-const db = require('../config/database'); // Correct path relative to api folder
+// checkProduct.js
+const db = require('./config/database');
 const meiliPkg = require('meilisearch');
 
 const MeiliSearch = meiliPkg.Meilisearch || meiliPkg.Meilisearch || meiliPkg.default || meiliPkg;
@@ -9,6 +9,7 @@ const meiliClient = new MeiliSearch({
     apiKey: 'Sj10MeiliSuperKey2026'
 });
 
+// Terminal se command parameter lene ke liye (e.g. node checkProduct.js 280941)
 const targetCode = process.argv[2] || "280941";
 
 async function extractFullProductData(markazCodeOrSku) {

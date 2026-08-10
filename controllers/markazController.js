@@ -368,7 +368,9 @@ exports.saveProduct = async (req, res) => {
         }
 
         const newId = uuidv4();
-        const slug = (title || "prod").toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
+// 🚨 YEH NEW UNIQUE SLUG CODE DAALEIN:
+const baseSlug = (title || "product").toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').substring(0, 50);
+const slug = `${baseSlug}-${markaz_product_code || Date.now().toString().slice(-6)}`;
         const now = new Date().toISOString();
 
         // --- STEP 2: INSERT INTO ORACLE POSTGRES ---
@@ -462,7 +464,8 @@ exports.bulkSaveProducts = async (req, res) => {
             if (uploadedUrls.length === 0) continue;
 
             const newId = uuidv4();
-            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 70);
+            const baseSlug = (title || "product").toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').substring(0, 50);
+const slug = `${baseSlug}-${markaz_product_code || Date.now().toString().slice(-6)}`;
             const now = new Date().toISOString();
 
             try {
