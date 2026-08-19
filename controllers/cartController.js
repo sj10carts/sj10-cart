@@ -53,7 +53,7 @@ const fetchVariantsFromOracle = async (variantIds) => {
 };
 
 // =========================================================
-// Main: Get Cart (Optimized for Oracle)
+// Main: Get Cart (With Real Supplier Brand Name)
 // =========================================================
 exports.getCart = async (req, res) => {
     try {
@@ -83,7 +83,7 @@ exports.getCart = async (req, res) => {
             } catch(e) {}
         });
 
-        // 2. Fetch Details from Oracle (Instead of Turso Shards)
+        // 2. Fetch Details from Oracle (Products & Variants)
         const [products, variants] = await Promise.all([
             fetchProductsFromOracle(productIds),
             fetchVariantsFromOracle(variantIds)
@@ -92,7 +92,22 @@ exports.getCart = async (req, res) => {
         const productMap = new Map(products.map(p => [String(p.id).trim(), p]));
         const variantMap = new Map(variants.map(v => [String(v.id).trim(), v]));
 
-        // 3. Merge Data
+        // 🟢 2.1 FETCH REAL SUPPLIER BRAND NAMES FROM TiDB
+        const supplierIds = [...new Set(products.map(p => p.supplier_id).filter(Boolean))];
+        let supplierMap = new Map();
+        if (supplierIds.length > 0) {
+            try {
+                const [sups] = await db.suppliers.query(
+                    "SELECT id, brand_name, full_name FROM suppliers WHERE id IN (?)", 
+                    [supplierIds]
+                );
+                sups.forEach(s => supplierMap.set(String(s.id).trim(), s.brand_name || s.full_name || 'SJ10 Official'));
+            } catch (e) {
+                console.error("⚠️ Supplier brand name fetch warning:", e.message);
+            }
+        }
+
+        // 3. Merge Data with Supplier Info
         const processedCart = cartItems.map(item => {
             const product = productMap.get(String(item.product_id).trim());
             
@@ -102,7 +117,6 @@ exports.getCart = async (req, res) => {
                 if (typeof parsedOptions === 'string') parsedOptions = JSON.parse(parsedOptions);
             } catch (e) {}
 
-            // Defaults from Product
             let unitPrice = parseFloat(product?.discounted_price || product?.price || 0);
             
             let imageUrls = [];
@@ -117,33 +131,23 @@ exports.getCart = async (req, res) => {
             let finalColor = product?.colors ? String(product.colors).replace(/[\[\]"]/g, '') : "Standard";
             let finalSize = product?.sizes ? String(product.sizes).replace(/[\[\]"]/g, '') : "Standard";
 
-            // Variant Overrides
             const vId = parsedOptions.variantId ? String(parsedOptions.variantId).trim() : null;
-            
             if (vId) {
                 const variant = variantMap.get(vId);
                 if (variant) {
                     unitPrice = parseFloat(variant.price || unitPrice);
-                    if (variant.image_url) {
-                        imageUrls = [variant.image_url, ...imageUrls];
-                    }
-                    if (variant.custom_color && variant.custom_color !== 'null') {
-                        finalColor = variant.custom_color;
-                    }
-                    if (variant.custom_size && variant.custom_size !== 'null') {
-                        finalSize = variant.custom_size;
-                    }
-                } else {
-                    if (parsedOptions.color && parsedOptions.color !== "Standard") finalColor = parsedOptions.color;
-                    if (parsedOptions.size && parsedOptions.size !== "Standard") finalSize = parsedOptions.size;
+                    if (variant.image_url) imageUrls = [variant.image_url, ...imageUrls];
+                    if (variant.custom_color && variant.custom_color !== 'null') finalColor = variant.custom_color;
+                    if (variant.custom_size && variant.custom_size !== 'null') finalSize = variant.custom_size;
                 }
-            } else {
-                if (parsedOptions.color && parsedOptions.color !== "Standard") finalColor = parsedOptions.color;
-                if (parsedOptions.size && parsedOptions.size !== "Standard") finalSize = parsedOptions.size;
             }
 
             const deliveryFee = calculateDeliveryFee(product?.package_information || "");
             const commission = calculateCommission(unitPrice);
+
+            // 🟢 REAL SUPPLIER BRAND NAME ATTACHED HERE
+            const supplierId = product?.supplier_id ? String(product.supplier_id).trim() : null;
+            const realBrandName = supplierId ? (supplierMap.get(supplierId) || 'SJ10 Official') : 'SJ10 Official';
 
             return {
                 cart_item_id: item.id,
@@ -159,7 +163,14 @@ exports.getCart = async (req, res) => {
                     size: finalSize
                 },
                 delivery_fee: deliveryFee,
-                system_commission: commission
+                system_commission: commission,
+                
+                // 🟢 NEW: Pass Supplier Details
+                supplier_id: supplierId,
+                supplier: {
+                    id: supplierId,
+                    brand_name: realBrandName
+                }
             };
         });
 
